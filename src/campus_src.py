@@ -162,6 +162,9 @@ def build_model_TCN(look_back, n_features):
     model.summary()
     return model
 
+
+
+
 def build_model_LSTM(look_back, n_features):
     model = Sequential()
 
@@ -264,7 +267,7 @@ def plot_loss(history):
     plt.show()
 
 
-def plot_predictions(model, X_test, y_test, start=0, end=400):
+def plot_predictions(model, X_test, y_test, start=0, end=400, label="Predicted"):
     """
     Plot real vs. predicted values for a model on test data.
 
@@ -280,9 +283,9 @@ def plot_predictions(model, X_test, y_test, start=0, end=400):
     predicted = model.predict(X_test).reshape(-1, 1)
 
     plt.figure(figsize=(10, 4))
-    plt.plot(y_test[start:end], label='Real Value')
-    plt.plot(predicted[start:end], label='Predicted Value', alpha=0.7)
-    plt.title('Real vs Predicted Value')
+    plt.plot(y_test[start:end], label='Real Traffic')
+    plt.plot(predicted[start:end], label=label, alpha=0.7)
+    plt.title(f"Real vs {label} Value")
     plt.ylabel('Value')
     plt.xlabel('Time Point')
     plt.legend()
@@ -316,3 +319,157 @@ def evaluate_regression(y_true, y_pred, print_result=True):
         print(f"R^2 Score: {r2}")
         print(f"Mean Absolute Percentage Error: {mape}")
     return results
+
+
+# ------------------------------------------------------------------
+# 1. 定義「CAP cost‐sensitive loss」，適用於單一輸出 (scalar)
+# ------------------------------------------------------------------
+def cap_loss(C_SLA, C_over):
+    """
+    回傳一個自訂 loss 函數，計算單一輸出容量與真實流量之間的
+    過度配置成本 + SLA 違約成本。
+    """
+    def loss_fn(y_true, y_pred):
+        # y_true, y_pred shape = (batch_size, 1)
+        diff = y_pred - y_true  # shape=(batch_size, 1)
+
+        # 過度配置 = max(y_pred - y_true, 0)
+        over = tf.maximum(diff, 0.0)
+
+        # SLA 違約 = max(y_true - y_pred, 0) = max(-diff, 0)
+        violation = tf.maximum(-diff, 0.0)
+
+        # 加權
+        loss_over = C_over * over
+        loss_sla  = C_SLA  * violation
+
+        # batch 方向做平均
+        return tf.reduce_mean(loss_over + loss_sla)
+    return loss_fn
+
+
+# ------------------------------------------------------------------
+# 2. 建立「單輸出」的 CAP TCN 模型
+# ------------------------------------------------------------------
+def build_model_CAP(look_back, n_features, C_SLA=10.0, C_over=1.0):
+    """
+    對應單一輸出 (Dense(1)) 的 Capacity Forecasting 模型。
+    look_back  : 歷史時間步長 (e.g. 24、48)。 
+    n_features : 特徵數 (通常=1, 代表該時間序列的流量值)。
+    C_SLA      : 當預測容量 < 真實流量時 (違約) 的成本權重。
+    C_over     : 當預測容量 > 真實流量時 (過度配置) 的成本權重。
+    """
+    model = Sequential()
+
+    # (1) TCN 隱藏層，output shape = (None, 64) 例如
+    model.add(
+        TCN(
+            input_shape=(look_back, n_features),
+            return_sequences=False,
+            kernel_size=2,
+            nb_filters=64,
+            dilations=[1, 2, 4, 8, 16, 32],
+            padding='causal',
+            use_skip_connections=True,
+            activation='relu',
+        )
+    )
+
+    # (2) 幾層 Dense + Dropout
+    model.add(Dense(64, activation='relu'))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dropout(0.05))
+
+    # (3) 最終輸出一個容量值
+    model.add(Dense(1, activation='linear'))
+
+    # (4) 用自訂的 CAP loss 編譯
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss=cap_loss(C_SLA=C_SLA, C_over=C_over),
+        metrics=[tf.keras.metrics.MeanAbsoluteError(name='MAE')]
+    )
+
+    model.summary()
+    return model
+
+def fgsm_inject_one_pos(model, X_np, y_np, epsilon, targeted=False, step_idx=None, feat_idx=None):
+    X_adv = X_np.copy().astype(np.float32)
+    y_tf = tf.convert_to_tensor(y_np, dtype=tf.float32)
+    X_var = tf.Variable(X_adv)
+    
+    # 创建损失函数实例
+    loss_fn = tf.keras.losses.MeanSquaredError()
+    
+    with tf.GradientTape() as tape:
+        tape.watch(X_var)
+        preds = model(X_var, training=False)
+        preds = tf.reshape(preds, y_tf.shape)
+        
+        # 使用损失函数实例计算损失
+        loss = loss_fn(y_tf, preds)
+        
+        if targeted:  # 添加定向攻击支持
+            loss = -loss
+
+    grad = tape.gradient(loss, X_var).numpy()
+    grad_sign = np.sign(grad)
+    grad_sign[grad_sign < 0] = 0  # 负梯度归零（与原始逻辑一致）
+    
+    # 新增一行，查看被选中位置的 gs 值
+    print("grad_sign 在 (step,feat)=", step_idx, feat_idx, "上的值：", 
+        np.unique(grad_sign[:, step_idx, feat_idx]))
+
+    # === 新增：创建特征掩码（只允许修改前3个特征） ===
+    # 假设输入形状为 (batch, time_steps, features)
+    feature_mask = np.zeros(X_adv.shape[-1])  # 特征维度的掩码
+    feature_mask[:3] = 1.0  # 只允许修改前3个特征
+    
+    # 应用扰动
+    if step_idx is not None and feat_idx is not None:
+        # 定点扰动模式：只修改特定位置
+        mask = np.zeros_like(grad_sign)
+        mask[:, step_idx, feat_idx] = 1.0
+        X_adv += epsilon * (grad_sign * mask)
+    else:
+        # 全局扰动模式：只修改前3个特征
+        # 将特征掩码广播到整个张量
+        broadcast_mask = np.zeros_like(X_adv)
+        broadcast_mask[..., :3] = 1.0  # 所有批次和时间步的前3个特征
+        
+        # 应用扰动时只修改允许的特征
+        X_adv += epsilon * (grad_sign * broadcast_mask)
+
+    return X_adv
+
+
+def compute_violation_rate(model, X_test, y_test):
+    """
+    計算回歸型模型在測試資料上的 SLA 違約率。
+    
+    參數:
+      - model: 已經訓練好的回歸模型，需有 predict 方法。
+      - X_test: 測試集特徵，形狀 (num_samples, look_back, n_features)。
+      - y_test: 測試集真實容量或流量標籤，形狀 (num_samples, 1) 或 (num_samples,)。
+      
+    回傳:
+      - violation_rate: SLA 違約率 (float)，即 y_pred < y_true 的比例。
+      - num_violations: 違約 (y_pred < y_true) 的樣本數。
+      - total: 總樣本數。
+    """
+    # 1. 取得模型預測值
+    y_pred = model.predict(X_test)
+    
+    # 2. 確保 y_test 與 y_pred 形狀匹配為 (num_samples,)
+    y_true = y_test.reshape(-1)
+    y_pred_flat = y_pred.reshape(-1)
+    
+    # 3. 計算違約次數 (預測 < 真實)
+    violations = (y_pred_flat < y_true)
+    num_violations = np.sum(violations)
+    total = len(y_true)
+    
+    # 4. 違約率
+    violation_rate = num_violations / total
+    
+    return violation_rate, int(num_violations), total
