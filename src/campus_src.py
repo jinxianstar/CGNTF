@@ -412,13 +412,15 @@ def fgsm_inject_one_pos(model, X_np, y_np, epsilon, targeted=False, step_idx=Non
         if targeted:  # 添加定向攻击支持
             loss = -loss
 
-    grad = tape.gradient(loss, X_var).numpy()
+    grad = tape.gradient(loss, X_var)
     grad_sign = np.sign(grad)
     grad_sign[grad_sign < 0] = 0  # 负梯度归零（与原始逻辑一致）
     
     # 新增一行，查看被选中位置的 gs 值
+    """
     print("grad_sign 在 (step,feat)=", step_idx, feat_idx, "上的值：", 
         np.unique(grad_sign[:, step_idx, feat_idx]))
+    """
 
     # === 新增：创建特征掩码（只允许修改前3个特征） ===
     # 假设输入形状为 (batch, time_steps, features)
@@ -473,3 +475,444 @@ def compute_violation_rate(model, X_test, y_test):
     violation_rate = num_violations / total
     
     return violation_rate, int(num_violations), total
+
+
+
+"""
+
+MIXUP
+
+"""
+def mixup_data(x1, y1, x2, y2, alpha=0.2):
+    """对两组样本 (x1,y1) 和 (x2,y2) 执行 Mixup 操作"""
+    lam = np.random.beta(alpha, alpha)
+    x_mix = lam * x1 + (1 - lam) * x2
+    y_mix = lam * y1 + (1 - lam) * y2
+    return x_mix, y_mix
+
+# 示例：在一个训练步骤或预测步骤中应用 FGSM + Mixup
+def train_step_with_mixup(model, X_clean_batch, y_batch, epsilon=0.1, alpha=0.2):
+    """
+    1. 对当前 batch 的干净样本生成 FGSM 对抗样本
+    2. 用 Mixup 将干净样本和对抗样本线性混合
+    3. 用混合样本训练模型
+    """
+    # 生成对抗样本
+    X_adv_batch = fgsm_inject_one_pos(model, X_clean_batch, y_batch, epsilon)
+
+    # 执行 Mixup
+    X_mix, y_mix = mixup_data(X_clean_batch, y_batch, X_adv_batch, y_batch, alpha)
+
+    # 将混合后的样本传入模型，进行一次训练更新
+    loss = model.train_on_batch(X_mix, y_mix)
+    return loss
+
+
+from tensorflow.keras.models import Model
+
+
+
+
+# —————————————————————————————————————————————————————————
+# 2) 用纯 TF 实现 FGSM＋Mixup，在子类里重写 train_step
+# —————————————————————————————————————————————————————————
+# 2) 修正 fgsm_generate：不要在这里创建新的 tf.Variable，只 watch 输入 tensor
+# -------------------------------------------------------
+class WrapperTCNWithFGSMMixup(Model):
+    def __init__(self,
+                 look_back,
+                 n_features,
+                 epsilon=0.1,
+                 alpha=0.2,
+                 step_idx=None,
+                 feat_idx=None):
+        """
+        - look_back, n_features: 传给 build_model_TCN，生成 backbone
+        - epsilon:    FGSM 扰动强度
+        - alpha:      Mixup 使用的 Beta(alpha, alpha) 参数
+        - step_idx:   如果非 None，就只在 time_step=step_idx, feat=feat_idx 上加扰动
+        - feat_idx:   同理；如果都为 None，则在每个 time_step 的前 3 个特征做全局扰动
+        """
+        super().__init__()
+        self.epsilon = epsilon
+        self.alpha   = alpha
+        self.step_idx = step_idx
+        self.feat_idx = feat_idx
+
+        # ① 原封不动地创建并编译好一个 TCN
+        self.backbone = build_model_TCN(look_back, n_features)
+
+        # ② 额外定义一个 optimizer，用于在 train_step 里更新 backbone
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+        # ③ 定义 loss_fn，与 build_model_TCN 内部的 rmse 保持一致
+        self.loss_fn = lambda y_true, y_pred: tf.sqrt(
+            tf.reduce_mean(tf.square(y_true - y_pred))
+        )
+
+    def compile(self, optimizer, loss, **kwargs):
+        """
+        重写 compile，接受 (optimizer, loss)，并存到 self.optimizer、self.loss_fn。
+        注意这里的参数名是 loss 而非 loss_fn。
+        """
+        super().compile(**kwargs)
+        self.optimizer = optimizer
+        self.loss_fn   = loss
+
+    def fgsm_generate(self, x_clean, y_true):
+        """
+        修正后的纯 TF 版 FGSM：
+        不在函数里创建新的 tf.Variable，只对 x_clean 本身调用 tape.watch，
+        然后计算 ∂Loss/∂x_clean，再乘梯度掩码得到 x_adv。
+        
+        - x_clean: tf.Tensor, shape=(batch, time_steps, n_features), dtype=tf.float32
+        - y_true:  tf.Tensor, shape=(batch, 1), dtype=tf.float32
+        返回：x_adv (tf.Tensor)，shape 同 x_clean
+        """
+        # 让 tape 看到 x_clean
+        with tf.GradientTape() as tape:
+            tape.watch(x_clean)  # 只要对 x_clean 求梯度就行，不必变成 Variable
+            preds = self.backbone(x_clean, training=False)
+            preds = tf.reshape(preds, tf.shape(y_true))  # 保持 (batch,1)
+            loss = self.loss_fn(y_true, preds)
+        grad = tape.gradient(loss, x_clean)  # ∂Loss/∂x_clean
+
+        # grad_sign：sign(grad) 后，把负数位置置零
+        grad_sign = tf.sign(grad)
+        grad_sign = tf.where(grad_sign < 0.0,
+                             tf.zeros_like(grad_sign),
+                             grad_sign)
+
+        # 构造扰动掩码
+        if (self.step_idx is not None) and (self.feat_idx is not None):
+            # 定点扰动：只在 (step_idx, feat_idx) 处为 1
+            mask = tf.zeros_like(grad_sign, dtype=tf.float32)
+            batch_size = tf.shape(mask)[0]
+            # 构造 [ [0,step,feat], [1,step,feat], ... ]
+            indices = tf.stack([
+                tf.range(batch_size),
+                tf.fill([batch_size], self.step_idx),
+                tf.fill([batch_size], self.feat_idx)
+            ], axis=1)
+            updates = tf.ones([batch_size], dtype=tf.float32)
+            mask = tf.tensor_scatter_nd_update(mask, indices, updates)
+        else:
+            # 全局扰动：time_steps 上的前 3 个特征都为 1
+            shape = tf.shape(grad_sign)  # [batch, time_steps, n_features]
+            mask = tf.concat([
+                tf.ones([shape[0], shape[1], 3], dtype=tf.float32),
+                tf.zeros([shape[0], shape[1], shape[2] - 3], dtype=tf.float32)
+            ], axis=2)
+
+        # 计算对抗样本并 clip 到 [0,1]
+        x_adv = x_clean + self.epsilon * (grad_sign * mask)
+        x_adv = tf.clip_by_value(x_adv, 0.0, 1.0)
+        return x_adv
+
+    def mixup(self, x1, y1, x2, y2):
+        """
+        Mixup：从 Beta(self.alpha, self.alpha) 抽一个 λ，然后线性混合。
+        返回：x_mix, y_mix。
+        """
+        lam = np.random.beta(self.alpha, self.alpha)
+        lam = tf.cast(lam, tf.float32)
+        x_mix = lam * x1 + (1.0 - lam) * x2
+        y_mix = lam * y1 + (1.0 - lam) * y2
+        return x_mix, y_mix
+
+    def train_step(self, data):
+        """
+        1) data = (x_clean, y_true)
+        2) x_adv = fgsm_generate(x_clean, y_true)
+        3) x_mix, y_mix = mixup(x_clean, y_true, x_adv, y_true)
+        4) 用 (x_mix, y_mix) 做一次 forward/backward 更新 backbone
+        """
+        x_clean, y_true = data  # x_clean: (batch, time_steps, n_features)，y_true: (batch,1)
+
+        # 1) 生成对抗样本
+        x_adv = self.fgsm_generate(x_clean, y_true)
+
+        # 2) Mixup
+        x_mix, y_mix = self.mixup(x_clean, y_true, x_adv, y_true)
+
+        # 3) 用混合样本做一次 forward/backward 更新 backbone 参数
+        with tf.GradientTape() as tape:
+            preds_mix = self.backbone(x_mix, training=True)
+            loss_value = self.loss_fn(y_mix, preds_mix)
+        grads = tape.gradient(loss_value, self.backbone.trainable_weights)
+        self.optimizer.apply_gradients(
+            zip(grads, self.backbone.trainable_weights)
+        )
+
+        return {"loss": loss_value}
+
+    def test_step(self, data):
+        """
+        model.evaluate(...) 调用，只用 x_clean 计算 loss。
+        """
+        x_clean, y_true = data
+        preds = self.backbone(x_clean, training=False)
+        val_loss = self.loss_fn(y_true, preds)
+        return {"loss": val_loss}
+
+    def call(self, inputs, training=None):
+        """
+        model.predict(...) 或 model(inputs) 时调用 backbone。
+        """
+        return self.backbone(inputs, training=training)
+    
+# -------------------------------------------------------
+# 2) 只改 WrapperTCNWithFGSMMixup，让它自动 reshape y_true
+# -------------------------------------------------------
+class WrapperTCNWithFGSMMixup(Model):
+    def __init__(self,
+                 look_back,
+                 n_features,
+                 epsilon=0.1,
+                 alpha=0.2,
+                 step_idx=None,
+                 feat_idx=None):
+        """
+        - look_back, n_features: 传给 build_model_TCN，生成 backbone
+        - epsilon:    FGSM 扰动强度
+        - alpha:      Mixup 使用的 Beta(alpha, alpha) 参数
+        - step_idx:   如果非 None，就只在 time_step=step_idx, feat=feat_idx 上加扰动
+        - feat_idx:   同理；如果都为 None，则在每个 time_step 的前 3 个特征做全局扰动
+        """
+        super().__init__()
+        self.epsilon = epsilon
+        self.alpha   = alpha
+        self.step_idx = step_idx
+        self.feat_idx = feat_idx
+
+        # ① 原封不动地创建并编译好一个 TCN
+        self.backbone = build_model_TCN(look_back, n_features)
+
+        # ② 定义一个 optimizer，用于在 train_step 里更新 backbone
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+        # ③ 定义 loss_fn，与 build_model_TCN 内部的 rmse 保持一致
+        self.loss_fn = lambda y_true, y_pred: tf.sqrt(
+            tf.reduce_mean(tf.square(y_true - y_pred))
+        )
+
+    def compile(self, optimizer, loss, **kwargs):
+        """
+        重写 compile，接受 (optimizer, loss)，并存到 self.optimizer、self.loss_fn。
+        注意这里的参数名是 loss 而非 loss_fn。
+        """
+        super().compile(**kwargs)
+        self.optimizer = optimizer
+        self.loss_fn   = loss
+
+    def fgsm_generate(self, x_clean, y_true):
+        """
+        修正后的纯 TF 版 FGSM，不在函数里创建新的 tf.Variable，只对 x_clean 本身调用 tape.watch，
+        然后计算 ∂Loss/∂x_clean，再乘梯度掩码得到 x_adv。
+        
+        - x_clean: tf.Tensor, shape=(batch, time_steps, n_features), dtype=tf.float32
+        - y_true:  tf.Tensor, shape=(batch, 1), dtype=tf.float32
+        返回：x_adv (tf.Tensor)，shape 同 x_clean
+        """
+        # 让 tape 看到 x_clean 这个张量
+        with tf.GradientTape() as tape:
+            tape.watch(x_clean)
+            preds = self.backbone(x_clean, training=False)
+            preds = tf.reshape(preds, tf.shape(y_true))
+            loss = self.loss_fn(y_true, preds)
+        grad = tape.gradient(loss, x_clean)  # ∂Loss/∂x_clean
+
+        # grad_sign：取 sign(grad)，然后把负数位置置零
+        grad_sign = tf.sign(grad)
+        grad_sign = tf.where(grad_sign < 0.0,
+                             tf.zeros_like(grad_sign),
+                             grad_sign)
+
+        # 构造扰动掩码
+        if (self.step_idx is not None) and (self.feat_idx is not None):
+            # 定点扰动：只在 (step_idx, feat_idx) 处为 1
+            mask = tf.zeros_like(grad_sign, dtype=tf.float32)
+            batch_size = tf.shape(mask)[0]
+            indices = tf.stack([
+                tf.range(batch_size),
+                tf.fill([batch_size], self.step_idx),
+                tf.fill([batch_size], self.feat_idx)
+            ], axis=1)  # shape=(batch,3)
+            updates = tf.ones([batch_size], dtype=tf.float32)
+            mask = tf.tensor_scatter_nd_update(mask, indices, updates)
+        else:
+            # 全局扰动：time_steps 上的前 3 个特征都为 1
+            shape = tf.shape(grad_sign)  # [batch, time_steps, n_features]
+            mask = tf.concat([
+                tf.ones([shape[0], shape[1], 3], dtype=tf.float32),
+                tf.zeros([shape[0], shape[1], shape[2] - 3], dtype=tf.float32)
+            ], axis=2)
+
+        # 计算对抗样本并 clip 到 [0,1]
+        x_adv = x_clean + self.epsilon * (grad_sign * mask)
+        x_adv = tf.clip_by_value(x_adv, 0.0, 1.0)
+        return x_adv
+
+    def mixup(self, x1, y1, x2, y2):
+        """
+        Mixup：从 Beta(self.alpha, self.alpha) 抽一个 λ，然后线性混合。
+        返回：x_mix, y_mix。
+        """
+        lam = np.random.beta(self.alpha, self.alpha)
+        lam = tf.cast(lam, tf.float32)
+        x_mix = lam * x1 + (1.0 - lam) * x2
+        y_mix = lam * y1 + (1.0 - lam) * y2
+        return x_mix, y_mix
+
+    def train_step(self, data):
+        """
+        在每个 batch 调用时：
+        1) data = (x_clean, y_true)
+        2) 先把 y_true reshape 成 (batch,1)
+        3) x_adv = fgsm_generate(x_clean, y_true)
+        4) x_mix, y_mix = mixup(x_clean, y_true, x_adv, y_true)
+        5) 用 (x_mix, y_mix) 做一次 forward/backward 更新 backbone
+        """
+        x_clean, y_true = data  # shape: x_clean=(B,T,F), y_true=(B,) 或 (B,1)
+        # —— 关键：强制把 y_true 变成 (batch,1)
+        y_true = tf.reshape(y_true, [-1, 1])
+
+        # 1) 生成对抗样本
+        x_adv = self.fgsm_generate(x_clean, y_true)
+
+        # 2) Mixup
+        x_mix, y_mix = self.mixup(x_clean, y_true, x_adv, y_true)
+
+        # 3) 用混合样本做一次 forward+backward 更新 backbone
+        with tf.GradientTape() as tape:
+            preds_mix = self.backbone(x_mix, training=True)
+            loss_value = self.loss_fn(y_mix, preds_mix)
+        grads = tape.gradient(loss_value, self.backbone.trainable_weights)
+        self.optimizer.apply_gradients(
+            zip(grads, self.backbone.trainable_weights)
+        )
+
+        return {"loss": loss_value}
+
+    def test_step(self, data):
+        """
+        model.evaluate(...) 时调用，只用“干净样本”计算一次 loss
+        """
+        x_clean, y_true = data
+        # —— 同样把 y_true reshape 成 (batch,1)
+        y_true = tf.reshape(y_true, [-1, 1])
+
+        preds = self.backbone(x_clean, training=False)
+        val_loss = self.loss_fn(y_true, preds)
+        return {"loss": val_loss}
+
+    def call(self, inputs, training=None):
+        """
+        model.predict(...) 或 model(inputs) 时，直接调用 backbone
+        """
+        return self.backbone(inputs, training=training)
+    
+
+
+class WrapperTCNWithFGSMMixup(Model):
+    def __init__(self,
+                 look_back,
+                 n_features,
+                 epsilon=0.1,
+                 alpha=0.3,
+                 step_idx=None,
+                 feat_idx=None):
+        super().__init__()
+        self.epsilon  = epsilon
+        self.alpha    = alpha
+        self.step_idx = step_idx
+        self.feat_idx = feat_idx
+
+        # 1) 建好 TCN backbone（內部已 compile，方便 predict）
+        self.backbone = build_model_TCN(look_back, n_features)
+
+        # 2) 預設 optimizer / loss_fn（compile 時可覆蓋）
+        self.optimizer = tf.keras.optimizers.Adam(1e-3)
+        self.loss_fn   = lambda y_t, y_p: tf.sqrt(
+            tf.reduce_mean(tf.square(y_t - y_p))
+        )
+
+    # ------------------------ compile -------------------------
+    def compile(self, optimizer, loss, **kwargs):
+        # run_eagerly=False 速度較快；若想除錯可設 True
+        super().compile(run_eagerly=False, **kwargs)
+        self.optimizer = optimizer
+        self.loss_fn   = loss
+        # 額外追蹤一個 mean metric
+        self.train_metric = tf.keras.metrics.Mean(name="train_rmse")
+        self.val_metric   = tf.keras.metrics.Mean(name="val_rmse")
+
+    # ------------------------ FGSM (呼叫 numpy 版) -------------
+    def fgsm_generate(self, x_clean, y_true):
+        """
+        用 tf.py_function 調用 numpy 版 FGSM。
+        必須在 _fgsm_np() 內把 Tensor 轉成 ndarray，否則 .copy() 會出錯。
+        """
+        def _fgsm_np(x_tf, y_tf):
+            # ★★★ 關鍵：Tensor → ndarray ★★★
+            x_np = x_tf.numpy()
+            y_np = y_tf.numpy()
+
+            adv_np = fgsm_inject_one_pos(
+                model   = self.backbone,   # 直接用 backbone
+                X_np    = x_np,
+                y_np    = y_np,
+                epsilon = self.epsilon,
+                targeted=False,
+                step_idx=self.step_idx,
+                feat_idx=self.feat_idx
+            )
+            return adv_np.astype(np.float32)
+
+        # 用 numpy_function 亦可，這裡維持 py_function
+        x_adv = tf.py_function(
+            func=_fgsm_np,
+            inp=[x_clean, y_true],
+            Tout=tf.float32
+        )
+        x_adv.set_shape(x_clean.shape)      # 靜態 shape
+        return x_adv
+    # ------------------------ Mix-up --------------------------
+    def mixup(self, x1, y1, x2, y2):
+        lam = tf.cast(np.random.beta(self.alpha, self.alpha), tf.float32)
+        return lam * x1 + (1. - lam) * x2, lam * y1 + (1. - lam) * y2
+
+    # ------------------------ train_step ----------------------
+    def train_step(self, data):
+        x_clean, y_true = data
+        y_true = tf.reshape(y_true, [-1, 1])
+
+        # 1) 產生對抗樣本
+        x_adv = self.fgsm_generate(x_clean, y_true)
+
+        # 2) 做 Mix-up
+        x_mix, y_mix = self.mixup(x_clean, y_true, x_adv, y_true)
+
+        # 3) 前向 + 反向
+        with tf.GradientTape() as tape:
+            preds = self.backbone(x_mix, training=True)
+            loss  = self.loss_fn(y_mix, preds)
+        grads = tape.gradient(loss, self.backbone.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.backbone.trainable_weights))
+
+        self.train_metric.update_state(loss)
+        return {"loss": self.train_metric.result()}
+
+    # ------------------------ test_step -----------------------
+    def test_step(self, data):
+        x_clean, y_true = data
+        y_true = tf.reshape(y_true, [-1, 1])
+
+        preds    = self.backbone(x_clean, training=False)
+        val_loss = self.loss_fn(y_true, preds)
+
+        self.val_metric.update_state(val_loss)
+        return {"loss": self.val_metric.result()}
+
+    # ------------------------ call ----------------------------
+    def call(self, inputs, training=None):
+        return self.backbone(inputs, training=training)
+    
