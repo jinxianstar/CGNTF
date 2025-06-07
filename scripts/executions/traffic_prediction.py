@@ -11,37 +11,40 @@ from datetime import datetime
 
 # 添加 src 文件夹到模块搜索路径
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
-
 # 然后导入模块
 import campus_src as cs
 
 # ==================== 函数定义 ====================
 
-def load_data(n_steps):
+def load_data(n_steps, target_index, dataset_name, only_one_feature):
     '''读取并预处理数据。
 
     假設 df_encoded 是你的 DataFrame，且已經按時間順序排序
     '''
     # 获取当前脚本文件的位置
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_path = os.path.join(script_dir, '..', '..', 'data', 'processed', 'campus_processed.csv')
-
+    data_path = os.path.join(script_dir, '..', '..', 'data', 'processed', f"{dataset_name}.csv")
+    
     df = pd.read_csv(data_path)
-    df = df.set_index('DateTime')
+    if "campus" in dataset_name:
+        df = df.set_index('DateTime')
+        if only_one_feature:
+            df = df[["value_avg"]]
+    else:
+        df = df.set_index('date')
 
-    X, y = cs.create_dataset(df.to_numpy(), n_steps)
+    X, y = cs.create_dataset(df.to_numpy(), n_steps, target_index)
     return X, y
 
 
-def prepare_datasets(X, y, n_steps):
+def prepare_datasets(X, y, max_num_of_features, train_ratio, validation_ratio):
     '''拆分並縮放資料集。'''
     X_train, X_validation, X_test, y_train, y_validation, y_test = cs.split_dataset(
-        X, y, train_ratio=0.75, validation_ratio=0.15
+        X, y, train_ratio=train_ratio, validation_ratio=validation_ratio
     )
 
     # 數值縮放
-    X_train, X_validation, X_test = cs.scaling(X_train, X_validation, X_test, n_steps)
-
+    X_train, X_validation, X_test = cs.scaling(X_train, X_validation, X_test, max_num_of_features)
     # 轉成 float32（TensorFlow 更友好）
     X_train = np.array(X_train, dtype=np.float32)
     y_train = np.array(y_train, dtype=np.float32)
@@ -55,7 +58,7 @@ def prepare_datasets(X, y, n_steps):
 
 # 忘記 mixup feature 2 了！！ (6/4)
 
-def build_mixup_model(look_back, n_features, epsilon=0.5, alpha=0.3, step_idx=None, feat_idx=None):
+def build_mixup_model(look_back, n_features, model_name, max_num_of_features, epsilon=0.5, alpha=0.3, step_idx=None, feat_idx=None):
     '''
     构建带 FGSM + Mixup 的 TCN 模型。
 
@@ -82,7 +85,9 @@ def build_mixup_model(look_back, n_features, epsilon=0.5, alpha=0.3, step_idx=No
         epsilon=epsilon,   # FGSM 扰动幅度
         alpha=alpha,       # Beta(α,α)，Mixup 的形状参数
         step_idx=step_idx, # 如果要“定点打扰”，可以设置一个整数
-        feat_idx=feat_idx  # 如果要“定点打扰”，可以设置一个整数
+        feat_idx=feat_idx,  # 如果要“定点打扰”，可以设置一个整数
+        model_name=model_name,
+        max_num_of_features=max_num_of_features
     )
 
     model.compile(
@@ -94,9 +99,13 @@ def build_mixup_model(look_back, n_features, epsilon=0.5, alpha=0.3, step_idx=No
     return model
 
 
-def build_normal_model(look_back, n_features):
+def build_normal_model(look_back, n_features, model_name):
     '''original models.'''
-    return cs.build_model_TCN(look_back, n_features)
+    if model_name == "TCN":
+        return cs.build_model_TCN(look_back, n_features)
+    elif model_name == "D-TCN":
+        return cs.build_model_double_TCN(look_back, n_features)
+
 
 
 # 举几个常见的 α 值特点：
@@ -122,19 +131,85 @@ def train_model(model, X_train, y_train, X_validation, y_validation, epochs=100,
     )
     return history
 
+def train_attack_model(model, X_train, y_train, X_validation, y_validation, epochs=100, batch_size=128):
+    '''训练模型并返回 history。'''
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
-def evaluate_and_attack(model_mixup, model_normal, X_test, y_test, epsilon, n_steps):
+    history = model.fit(
+        X_train,
+        y_train,
+        epochs=epochs,
+        batch_size=batch_size,
+        validation_data=(X_validation, y_validation),
+        callbacks=[early_stopping]
+    )
+    return history
+
+
+
+def evaluate_and_attack(model_mixup, model_normal, X_test, y_test, epsilon, step_idx, max_num_of_features, feat_idx=[0, 1, 2]):
     '''生成對抗樣本並返回它們。'''
-    # 被mixup模型干擾
-    X_test_adv_mixup = cs.fgsm_inject_one_pos(model_mixup, X_test, y_test, epsilon, step_idx=n_steps-1, feat_idx=[1, 2])
-    # 被普通模型干擾
-    X_test_adv_normal = cs.fgsm_inject_one_pos(model_normal, X_test, y_test, epsilon, step_idx=n_steps-1, feat_idx=[1, 2])
+    X_test_adv_mixup = cs.fgsm_inject_one_pos(
+        model_mixup,
+        X_test,
+        y_test,
+        epsilon,
+        step_idx=step_idx,
+        feat_idx=(feat_idx if feat_idx is not None else None)
+    )
+
+    # 被普通模型干扰
+    X_test_adv_normal = cs.fgsm_inject_one_pos(
+        model_normal,
+        X_test,
+        y_test,
+        epsilon,
+        step_idx=step_idx,
+        feat_idx=(feat_idx if feat_idx is not None else None),
+        max_num_of_features=max_num_of_features
+    )
+
+    diff = X_test_adv_mixup - X_test
+
+    # To show the element-wise difference, you can print the first few rows (or handle it as necessary)
+    print(diff[:5])  # Show the first 5 examples' differences
+
+    # If you want to see statistics for the differences, you could do:
+    mean_diff = np.mean(diff, axis=0)
+    std_diff = np.std(diff, axis=0)
+
+    print("Mean of differences per feature:", mean_diff)
+    print("Standard deviation of differences per feature:", std_diff)
+    
     return X_test_adv_mixup, X_test_adv_normal
 
-def report_results(model, X_test, y_test):
+def report_results(model, X_test, y_test, above_half_range):
     predicted = model.predict(X_test).reshape(-1, 1)
-    return cs.evaluate_regression(y_test, predicted)
-    
+    if above_half_range:
+        return cs.evaluate_regression_above_half_range(y_test, predicted)
+    else:
+        return cs.evaluate_regression(y_test, predicted)
+
+
+def attack_all_add_pct(X, step_idx=7, feat_idx=[], pct=0.05):
+    """
+    对 X 中所有样本，在指定的 step_idx 和 feat_idx 位置，
+    将原值增加 pct * 原值（即乘以 1+pct）。
+
+    参数：
+        X (np.ndarray): 待“攻击”的三维数组，shape=(n_samples, n_steps, n_features)
+        step_idx (int): 时间步的索引，比如第8步就传 7
+        feat_idx (int): 特征的索引，比如第2个特征就传 1
+        pct (float): 增加比例，默认 0.05（5%）
+
+    返回：
+        np.ndarray: 攻击后的数组副本
+    """
+    X_attacked = X.copy()
+    for i in feat_idx:
+        X_attacked[:, step_idx, i] *= (1 + pct)
+    return X_attacked
+
 
 # def report_results(model_mixup, model_normal, X_test, y_test, X_test_adv_mixup, X_test_adv_normal):
 #     '''列印評估結果。'''
@@ -159,50 +234,89 @@ def report_results(model, X_test, y_test):
 
 # ==================== 主程式入口 ====================
 
-def main():
-    # n_steps = 8  # 例如，使用t以及前面5步作為特徵
-    # 論文設定成3
-    n_steps = 8
+def main(dt_now):
+    
+    """
+        PARAMETERS
+    """
+    look_back = 8
 
-    X, y = load_data(n_steps)
-    X_train, X_validation, X_test, y_train, y_validation, y_test = prepare_datasets(X, y, n_steps)
+    test_epsilon = 0.2
+    mixup_epsilon = 0.2 #擾動
 
-    look_back = n_steps
-    n_features = X_train.shape[2]
+    mixup_alpha = 0.3 # B
+
     batch_size = 128
+    step_idx = look_back - 1
+    feat_idx = [0, 1, 2]
+    model_name = "D-TCN"
+    train_ratio = 0.75
+    validation_ratio = 0.125
+    max_features = 3
+    target_index = 1
+
+    evalute_above_50percent=True
+    dataset_name = "campus_processed" # campus_processed, Abilene, CERNET
+
+    attack_method = "FGSM" #  FGSM or  normal
+
+    only_one_feature = True
+
+    if only_one_feature:
+        max_features = 1
+        target_index = 0
+        feat_idx = [0]
+
+    X, y = load_data(look_back, target_index=target_index, dataset_name=dataset_name, only_one_feature=only_one_feature)
+    
+    print(X)
+    X_train, X_validation, X_test, y_train, y_validation, y_test = prepare_datasets(X, y, max_features, train_ratio=train_ratio, validation_ratio=validation_ratio)
+
+    n_features = X_train.shape[2]
+    print("current number of features:", n_features)
+
 
     # ===== 构建並训练 Mixup 模型 =====
     mixup_model = build_mixup_model(
         look_back=look_back,
         n_features=n_features,
-        epsilon=0.5,
-        alpha=0.3,
-        step_idx=look_back-1,
-        feat_idx=[1, 2]
+        epsilon=mixup_epsilon,
+        alpha=mixup_alpha,
+        step_idx=step_idx,
+        feat_idx=feat_idx,
+        model_name=model_name,
+        max_num_of_features=max_features
     )
+    
 
+    
     mixup_history = train_model(mixup_model, X_train, y_train, X_validation, y_validation, epochs=100, batch_size=batch_size)
     #cs.plot_loss(mixup_history)
 
     # ===== 构建並训练普通模型 =====
-    normal_model = build_normal_model(look_back, n_features)
+    normal_model = build_normal_model(look_back, n_features, model_name)
     normal_history = train_model(normal_model, X_train, y_train, X_validation, y_validation, epochs=100, batch_size=batch_size)
     #cs.plot_loss(normal_history)
 
     # ===== 生成對抗樣本並評估 =====
-    epsilon = 0.3
-    X_test_adv_mixup, X_test_adv_normal = evaluate_and_attack(mixup_model, normal_model, X_test, y_test, epsilon, n_steps)
+    #epsilon = 0.2
+    # FGSM + Mixup 擾動
+    if attack_method == "FGSM":
+        _, X_test_adv_mixup = evaluate_and_attack(mixup_model, normal_model, X_test, y_test, test_epsilon, step_idx=step_idx, feat_idx=feat_idx, max_num_of_features=max_features)
+    
+    elif attack_method == "Normal": # 固定黑盒式擾動
+        X_test_attacked = attack_all_add_pct(X_test, step_idx=step_idx, feat_idx=feat_idx, pct=test_epsilon)
+        # X_test_attacked = attack_all_add_pct(X_test_attacked, step_idx=step_idx, feat_idx=2, pct=test_epsilon)
+        X_test_adv_mixup = X_test_attacked.copy()
 
-    #cs.plot_predictions(mixup_model, X_test_adv_mixup, y_test, start=0, end=400, title="Preidcted by Mixup model, FGSM by Mixup model")
-    #cs.plot_predictions(mixup_model, X_test, y_test, start=0, end=400, title="Predicted Mixup model, Non-attack Input")
-    #cs.plot_predictions(normal_model, X_test_adv_normal, y_test, start=0, end=400, title="Preidcted by Normal model, FGSM by Normal model")
-    #cs.plot_predictions(normal_model, X_test, y_test, start=0, end=400, title="Preidcted by Normal model, Non-attack Input")
 
-
-
+    # cs.plot_predictions(mixup_model, X_test_adv_mixup, y_test, start=0, end=800, title="Preidcted by Mixup model, FGSM by Mixup model")
+    # cs.plot_predictions(mixup_model, X_test, y_test, start=0, end=800, title="Predicted Mixup model, Non-attack Input")
+    # cs.plot_predictions(normal_model, X_test_adv_mixup, y_test, start=0, end=800, title="Preidcted by Normal model, FGSM by Mixup model")
+    # cs.plot_predictions(normal_model, X_test, y_test, start=0, end=800, title="Preidcted by Normal model, Non-attack Input")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_path = os.path.join(script_dir, '..', '..', 'outputs', 'logs', 'log.txt')
+    data_path = os.path.join(script_dir, '..', '..', 'outputs', 'logs', f"log{dt_now}.txt")
 
     with open(data_path, "a") as f:
         with redirect_stdout(f):
@@ -213,19 +327,25 @@ def main():
             print("=============================================")
             print('Mixup Method')
             print('以下：未擾動')
-            report_results(mixup_model, X_test, y_test)
+            report_results(mixup_model, X_test, y_test, evalute_above_50percent)
             print('以下：擾動')
-            report_results(mixup_model, X_test_adv_mixup, y_test)
+            report_results(mixup_model, X_test_adv_mixup, y_test, evalute_above_50percent)
             print("---------------------------------------------")
             print('Normal Method')
             print('以下：未擾動')
-            report_results(normal_model, X_test, y_test)
+            report_results(normal_model, X_test, y_test, evalute_above_50percent)
             print('以下：擾動')
-            report_results(normal_model, X_test_adv_mixup, y_test)
+
+            # 注意這邊，如果你想要測試集一樣
+            report_results(normal_model, X_test_adv_mixup, y_test, evalute_above_50percent)
+            # 注意這邊，測試集不一樣
+            #report_results(normal_model, X_test_adv_normal, y_test)
             print("=============================================")
     #report_results(mixup_model, normal_model, X_test, y_test, X_test_adv_mixup, X_test_adv_normal)
 
 
 if __name__ == '__main__':
+    dt = datetime.now()
     for i in range(10):
-        main()
+        print(i)
+        main(dt)

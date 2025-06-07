@@ -1,10 +1,10 @@
 import numpy as np
 
-def create_dataset(data, n_steps):
+def create_dataset(data, n_steps, target_index):
     X, y = [], []
     for i in range(n_steps, len(data)):
         X.append(data[i-n_steps:i])
-        y.append(data[i, 1])
+        y.append(data[i, target_index])
     return np.array(X), np.array(y)
 
 
@@ -42,7 +42,7 @@ def split_dataset(X, y, train_ratio=0.75, validation_ratio=0.15):
 
 
 from sklearn.preprocessing import StandardScaler
-def scaling(X_train, X_validation, X_test, num_features=4):
+def scaling(X_train, X_validation, X_test, max_num_of_features):
     # 初始化标准化器
 
     # 初始化用于存储缩放后的数据的变量
@@ -51,7 +51,7 @@ def scaling(X_train, X_validation, X_test, num_features=4):
     X_test_scaled = np.copy(X_test)
 
     # 对每个特征进行标准化处理
-    for i in range(num_features):
+    for i in range(max_num_of_features):
         scaler = StandardScaler()
         #scaler = MinMaxScaler()
         # 对训练数据进行标准化
@@ -321,6 +321,62 @@ def evaluate_regression(y_true, y_pred, print_result=True):
     return results
 
 
+def evaluate_regression_above_half_range(y_true, y_pred, print_result=True):
+    """
+    只对 y_true > (max(y_true)-min(y_true)) / 2 的子集计算回归指标
+    """
+    # 1. 将输入转为 NumPy 数组（如果不是的话）
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    # 2. 计算 y_true 的最大值和最小值
+    y_max = y_true.max()
+    y_min = y_true.min()
+    # 3. 计算阈值：range 的一半
+    half_range = (y_max - y_min) / 2.0
+
+    # 4. 过滤出 y_true > half_range 的索引
+    mask = y_true > half_range
+    # 如果想要取“位于上半区间”而不是直接 vs. 0，也可以改为：
+    # midpoint = y_min + (y_max - y_min) / 2.0
+    # mask = y_true > midpoint
+
+    # 5. 取出子集
+    y_true_sub = y_true[mask]
+    y_pred_sub = y_pred[mask]
+
+    # 如果没有样本满足条件，直接返回空或提示
+    if y_true_sub.size == 0:
+        if print_result:
+            print("没有样本的 y_true 大于  (max-min)/2，无法计算指标。")
+        return {}
+
+    # 6. 计算各指标
+    mse = mean_squared_error(y_true_sub, y_pred_sub)
+    mae = mean_absolute_error(y_true_sub, y_pred_sub)
+    rmse = sqrt(mse)
+    r2 = r2_score(y_true_sub, y_pred_sub)
+    mape = mean_absolute_percentage_error(y_true_sub, y_pred_sub)
+
+    results = {
+        'MAE': mae,
+        'MSE': mse,
+        'RMSE': rmse,
+        'R2': r2,
+        'MAPE': mape
+    }
+
+    # 7. 可选：打印结果
+    if print_result:
+        print(f"筛选后样本数：{y_true_sub.size}（原始样本数：{y_true.size}）")
+        print(f"Mean Absolute Error (MAE): {mae}")
+        print(f"Mean Squared Error (MSE): {mse}")
+        print(f"Root Mean Squared Error (RMSE): {rmse}")
+        print(f"R^2 Score: {r2}")
+        print(f"Mean Absolute Percentage Error (MAPE): {mape}")
+
+    return results
+
 # ------------------------------------------------------------------
 # 1. 定義「CAP cost‐sensitive loss」，適用於單一輸出 (scalar)
 # ------------------------------------------------------------------
@@ -399,7 +455,7 @@ def fgsm_inject_one_pos(
     targeted=False, step_idx=None, feat_idx=None, max_num_of_features = 3
 ):
     """
-    基于 FGSM 的单点/多点注入扰动函数（标准 FGSM 版本）。
+    基于 FGSM 的单点/多点注入扰动函数（修改后：只做“增加”扰动，不做“减少”）。
     - model: tf.keras.Model，输出形状需与 y_np 一致
     - X_np: numpy.ndarray，shape=(batch_size, time_steps, num_features) 或 (batch_size, num_features)
     - y_np: numpy.ndarray，shape 与 model(X).numpy() 匹配
@@ -421,32 +477,34 @@ def fgsm_inject_one_pos(
     with tf.GradientTape() as tape:
         tape.watch(X_var)
         preds = model(X_var, training=False)
-        # 如果 preds 形状本来和 y_tf 一致，就不需要下面这行 reshape
-        # preds = tf.reshape(preds, y_tf.shape)
         loss = loss_fn(y_tf, preds)
         if targeted:
             loss = -loss  # 定向攻击：让预测更“贴近” y_np
 
     grad = tape.gradient(loss, X_var).numpy()
-    grad_sign = np.sign(grad)  # -1, 0, +1，保留全部
+    grad_sign = np.sign(grad)  # 取符号：-1, 0, +1
 
-    # -------- 4. 应用扰动 --------
+    # -------- 3.1 只保留正方向扰动，将负号和 0 都置为 0 --------
+    # 这样一来，grad_pos 只有 0 或 +1
+    grad_pos = np.where(grad_sign > 0, 1.0, 0.0)
+
+    # -------- 4. 应用扰动（仅往上增加） --------
     if (step_idx is not None) and (feat_idx is not None):
         # “定点”扰动：只针对特定 time step 和特征列
-        mask = np.zeros_like(grad_sign)
+        mask = np.zeros_like(grad_pos)
 
         if isinstance(feat_idx, (list, tuple, np.ndarray)):
             # 三维示例：(batch_size, time_steps, num_features)
             mask[:, step_idx, feat_idx] = 1.0
-            #print(mask[:, step_idx])
         else:
             mask[:, step_idx, feat_idx] = 1.0
 
-        X_adv = X_adv + epsilon * (grad_sign * mask)
+        # 只会在 grad_pos 为 1 的位置，叠加 +epsilon
+        X_adv = X_adv + epsilon * (grad_pos * mask)
 
     else:
         # “全局”扰动：针对所有样本，所有 time step / 所有位置的前 3 列
-        mask = np.zeros_like(grad_sign)
+        mask = np.zeros_like(grad_pos)
         if mask.ndim == max_num_of_features:
             mask[..., :max_num_of_features] = 1.0   # (batch_size, time_steps, num_features)
         elif mask.ndim == 2:
@@ -454,9 +512,11 @@ def fgsm_inject_one_pos(
         else:
             raise ValueError("X_np 的维度既不是 2 也不是 3，无法按前 3 列做扰动。")
 
-        X_adv = X_adv + epsilon * (grad_sign * mask)
+        # 同样，只会在 grad_pos 为 1 的位置，叠加 +epsilon
+        X_adv = X_adv + epsilon * (grad_pos * mask)
 
     return X_adv
+
 
 
 def compute_violation_rate(model, X_test, y_test):
@@ -503,19 +563,25 @@ class WrapperTCNWithFGSMMixup(Model):
     def __init__(self,
                  look_back,
                  n_features,
+                 max_num_of_features,
                  epsilon=0.1,
                  alpha=0.3,
                  step_idx=None,
-                 feat_idx=None):
+                 feat_idx=None,
+                 model_name=None):
         super().__init__()
+        self.max_num_of_features = max_num_of_features
         self.epsilon  = epsilon
         self.alpha    = alpha
         self.step_idx = step_idx
         self.feat_idx = feat_idx
 
         # 1) 建好 TCN backbone（內部已 compile，方便 predict）
-        self.backbone = build_model_TCN(look_back, n_features)
-
+        if model_name == 'TCN':
+            self.backbone = build_model_TCN(look_back, n_features)
+        elif model_name == "D-TCN":
+            self.backbone = build_model_double_TCN(look_back, n_features)
+        
         # 2) 預設 optimizer / loss_fn（compile 時可覆蓋）
         self.optimizer = tf.keras.optimizers.Adam(1e-3)
         self.loss_fn   = lambda y_t, y_p: tf.sqrt(
@@ -550,7 +616,8 @@ class WrapperTCNWithFGSMMixup(Model):
                 epsilon = self.epsilon,
                 targeted=False,
                 step_idx=self.step_idx,
-                feat_idx=self.feat_idx
+                feat_idx=self.feat_idx,
+                max_num_of_features=self.max_num_of_features
             )
             return adv_np.astype(np.float32)
 
@@ -595,6 +662,520 @@ class WrapperTCNWithFGSMMixup(Model):
 
         preds    = self.backbone(x_clean, training=False)
         val_loss = self.loss_fn(y_true, preds)
+
+        self.val_metric.update_state(val_loss)
+        return {"loss": self.val_metric.result()}
+
+    # ------------------------ call ----------------------------
+    def call(self, inputs, training=None):
+        return self.backbone(inputs, training=training)
+    
+
+class WrapperTCNWithFGSMMixup(Model):
+    """
+    TCN + FGSM + Mixup  (labels & inputs both mixed, per-example λ)
+
+    - look_back, n_features : 交給 backbone 建模  
+    - max_num_of_features   : FGSM 注入上限  
+    - epsilon               : FGSM 擾動幅度  
+    - alpha                 : Mixup 的 Beta(α, α) 參數  
+    - step_idx / feat_idx   : 指定 FGSM 注入的時間步 / 特徵 (選填)  
+    """
+    def __init__(self,
+                 look_back,
+                 n_features,
+                 max_num_of_features,
+                 epsilon=0.1,
+                 alpha=0.3,
+                 step_idx=None,
+                 feat_idx=None,
+                 model_name=None):
+        super().__init__()
+        self.max_num_of_features = max_num_of_features
+        self.epsilon  = epsilon
+        self.alpha    = alpha
+        self.step_idx = step_idx
+        self.feat_idx = feat_idx
+
+        # 1) 建好 TCN backbone（內部已 compile，方便 predict）
+        if model_name == 'TCN':
+            self.backbone = build_model_TCN(look_back, n_features)
+        elif model_name == "D-TCN":
+            self.backbone = build_model_double_TCN(look_back, n_features)
+        else:
+            raise ValueError("model_name must be 'TCN' or 'D-TCN'.")
+
+        # 2) 預設 optimizer / loss_fn（compile 時可覆蓋）
+        self.optimizer = tf.keras.optimizers.Adam(1e-3)
+        # 預設使用 RMSE
+        self.loss_fn = lambda y_t, y_p: tf.sqrt(
+            tf.reduce_mean(tf.square(y_t - y_p))
+        )
+
+    # ------------------------ compile -------------------------
+    def compile(self, optimizer=None, loss=None, **kwargs):
+        """
+        覆蓋 Keras compile，只接收 optimizer / loss，
+        其他傳給父類別；run_eagerly=False 速度較快。
+        """
+        super().compile(run_eagerly=False, **kwargs)
+        if optimizer is not None:
+            self.optimizer = optimizer
+        if loss is not None:
+            self.loss_fn   = loss
+
+        self.train_metric = tf.keras.metrics.Mean(name="train_rmse")
+        self.val_metric   = tf.keras.metrics.Mean(name="val_rmse")
+
+    # ------------------------ FGSM (呼叫 numpy 版) -------------
+    def fgsm_generate(self, x_clean, y_true):
+        """
+        透過 tf.py_function 呼叫純 numpy 版 FGSM，
+        以避免在 Tensor 上做 .copy() 觸發錯誤。
+        """
+        def _fgsm_np(x_tf, y_tf):
+            x_np = x_tf.numpy()
+            y_np = y_tf.numpy()
+
+            adv_np = fgsm_inject_one_pos(
+                model   = self.backbone,
+                X_np    = x_np,
+                y_np    = y_np,
+                epsilon = self.epsilon,
+                targeted=False,
+                step_idx=self.step_idx,
+                feat_idx=self.feat_idx,
+                max_num_of_features=self.max_num_of_features
+            )
+            return adv_np.astype(np.float32)
+
+        x_adv = tf.py_function(
+            func=_fgsm_np,
+            inp=[x_clean, y_true],
+            Tout=tf.float32
+        )
+        x_adv.set_shape(x_clean.shape)      # 保留靜態 shape
+        return x_adv
+
+    # ------------------------ Mix-up --------------------------
+    def mixup(self, x1, y1, x2, y2):
+        """
+        Per-example Mixup — λ ~ Beta(α, α)
+        同一個 λ 同時混 inputs 與 labels
+        假設 x 是 (B, T, F)，y 是 (B, 1)；可視需求調整 broadcast 維度
+        """
+        batch_size = tf.shape(x1)[0]
+
+        # 1) 產生 per-example λ  (shape = (B,))
+        # lam = tf.random.gamma(shape=[batch_size],
+        #                       alpha=self.alpha,
+        #                       beta=self.alpha,
+        #                       dtype=x1.dtype)          # 與 x 同 dtype
+        lam = tf.squeeze(tf.random.beta([batch_size], self.alpha, self.alpha), axis=0)
+
+
+        # 2) broadcast 到 inputs / labels
+        lam_x = tf.reshape(lam, [-1, 1, 1])            # (B, 1, 1) → broadcast 到 (B, T, F)
+        lam_y = tf.reshape(lam, [-1, 1])               # (B, 1)   → broadcast 到 (B, 1)
+
+        x_mix = lam_x * x1 + (1.0 - lam_x) * x2
+        y_mix = lam_y * y1 + (1.0 - lam_y) * y2
+        return x_mix, y_mix
+
+    # ------------------------ train_step ----------------------
+    def train_step(self, data):
+        """
+        1) FGSM 產生 adversarial samples  
+        2) 將 adv 注回 batch 並打亂，製造 (clean, adv_shuffled) 配對  
+        3) 進行 Mixup → 前向 → 反向
+        """
+        x_clean, y_true = data
+        y_true = tf.reshape(y_true, [-1, 1])           # (B,) → (B,1)
+
+        # 1) adversarial
+        x_adv = self.fgsm_generate(x_clean, y_true)
+
+        # 2) 打亂 batch 產生 (x2, y2)
+        idx = tf.random.shuffle(tf.range(tf.shape(x_clean)[0]))
+        x2  = tf.gather(x_adv, idx)
+        y2  = tf.gather(y_true, idx)
+
+        # 3) Mixup (clean ↔ shuffled adversarial)
+        x_mix, y_mix = self.mixup(x_clean, y_true, x2, y2)
+
+        # 4) 前向 + 反向
+        with tf.GradientTape() as tape:
+            preds = self.backbone(x_mix, training=True)
+            loss  = self.loss_fn(y_mix, preds)
+
+        grads = tape.gradient(loss, self.backbone.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.backbone.trainable_weights))
+
+        self.train_metric.update_state(loss)
+        return {"loss": self.train_metric.result()}
+
+    # ------------------------ test_step -----------------------
+    def test_step(self, data):
+        x, y = data
+        y = tf.reshape(y, [-1, 1])
+
+        preds    = self.backbone(x, training=False)
+        val_loss = self.loss_fn(y, preds)
+
+        self.val_metric.update_state(val_loss)
+        return {"loss": self.val_metric.result()}
+
+    # ------------------------ call ----------------------------
+    def call(self, inputs, training=None):
+        return self.backbone(inputs, training=training)
+
+class WrapperTCNWithFGSMMixup(Model):
+    """
+    TCN + FGSM + 標準 Mixup (per-example λ，混合不同樣本)
+    
+    - look_back, n_features : 交給 backbone 建模
+    - max_num_of_features   : FGSM 注入上限
+    - epsilon               : FGSM 擾動幅度
+    - alpha                 : Mixup 的 Beta(α, α) 參數
+    - step_idx / feat_idx   : 指定 FGSM 注入的時間步 / 特徵 (選填)
+    """
+    def __init__(self,
+                 look_back,
+                 n_features,
+                 max_num_of_features,
+                 epsilon=0.1,
+                 alpha=0.3,
+                 step_idx=None,
+                 feat_idx=None,
+                 model_name=None):
+        super().__init__()
+        self.max_num_of_features = max_num_of_features
+        self.epsilon  = epsilon
+        self.alpha    = alpha
+        self.step_idx = step_idx
+        self.feat_idx = feat_idx
+
+        # 1) 建好 TCN backbone
+        if model_name == 'TCN':
+            self.backbone = build_model_TCN(look_back, n_features)
+        elif model_name == "D-TCN":
+            self.backbone = build_model_double_TCN(look_back, n_features)
+        else:
+            raise ValueError("model_name must be 'TCN' or 'D-TCN'.")
+
+        # 2) 預設 optimizer / loss_fn
+        self.optimizer = tf.keras.optimizers.Adam(1e-3)
+        self.loss_fn   = lambda y_t, y_p: tf.sqrt(
+            tf.reduce_mean(tf.square(y_t - y_p))
+        )
+
+    # ------------------------ compile -------------------------
+    def compile(self, optimizer=None, loss=None, **kwargs):
+        super().compile(run_eagerly=False, **kwargs)
+        if optimizer is not None:
+            self.optimizer = optimizer
+        if loss is not None:
+            self.loss_fn   = loss
+
+        self.train_metric = tf.keras.metrics.Mean(name="train_rmse")
+        self.val_metric   = tf.keras.metrics.Mean(name="val_rmse")
+
+    # ------------------------ FGSM (呼叫 numpy 版) -------------
+    def fgsm_generate(self, x_clean, y_true):
+        def _fgsm_np(x_tf, y_tf):
+            x_np = x_tf.numpy()
+            y_np = y_tf.numpy()
+
+            adv_np = fgsm_inject_one_pos(
+                model   = self.backbone,
+                X_np    = x_np,
+                y_np    = y_np,
+                epsilon = self.epsilon,
+                targeted=False,
+                step_idx=self.step_idx,
+                feat_idx=self.feat_idx,
+                max_num_of_features=self.max_num_of_features
+            )
+            return adv_np.astype(np.float32)
+
+        x_adv = tf.py_function(
+            func=_fgsm_np,
+            inp=[x_clean, y_true],
+            Tout=tf.float32
+        )
+        x_adv.set_shape(x_clean.shape)
+        return x_adv
+
+    # ------------------------ 標準 Mix-up (per-example λ) -------
+    def mixup(self, x1, y1, x2, y2):
+        """
+        標準 Mixup 實現:
+        - 每個樣本有自己的 λ ~ Beta(α, α)
+        - λ 同時應用於輸入和標籤
+        - 支持不同形狀的輸入 (B, T, F) 和標籤 (B, 1)
+        """
+        batch_size = tf.shape(x1)[0]
+        
+        # 1) 產生 per-example λ (shape = [batch_size])
+        lam = tf.random.gamma(
+            shape=[batch_size], 
+            alpha=self.alpha, 
+            beta=self.alpha,
+            dtype=x1.dtype
+        )
+        
+        # 2) 擴展維度以匹配輸入和標籤形狀
+        # 輸入: (B, T, F) → 需要 (B, 1, 1) 進行廣播
+        lam_x = tf.reshape(lam, [-1, 1, 1])
+        
+        # 標籤: (B, 1) → 需要 (B, 1) 進行廣播
+        lam_y = tf.reshape(lam, [-1, 1])
+        
+        # 3) 執行混合
+        x_mix = lam_x * x1 + (1 - lam_x) * x2
+        y_mix = lam_y * y1 + (1 - lam_y) * y2
+        
+        return x_mix, y_mix
+
+    # ------------------------ train_step (標準 Mixup) -----------
+    def train_step(self, data):
+        """
+        標準 Mixup 訓練步驟:
+        1. 生成對抗樣本
+        2. 將原始樣本和對抗樣本合併
+        3. 打亂後拆分為兩個集合
+        4. 對兩個集合進行 Mixup
+        5. 使用混合數據訓練
+        """
+        x_clean, y_true = data
+        y_true = tf.reshape(y_true, [-1, 1])  # (B,) → (B,1)
+        batch_size = tf.shape(x_clean)[0]
+
+        # 1) 生成對抗樣本 (保持原始標籤)
+        x_adv = self.fgsm_generate(x_clean, y_true)
+
+        # 2) 合併原始樣本和對抗樣本
+        x_all = tf.concat([x_clean, x_adv], axis=0)  # (2B, T, F)
+        y_all = tf.concat([y_true, y_true], axis=0)  # (2B, 1)
+
+        # 3) 打亂整個數據集
+        total_size = 2 * batch_size
+        indices = tf.random.shuffle(tf.range(total_size))
+        x_shuffled = tf.gather(x_all, indices)
+        y_shuffled = tf.gather(y_all, indices)
+
+        # 4) 拆分為兩個集合 (各B個樣本)
+        x1 = x_shuffled[:batch_size]
+        y1 = y_shuffled[:batch_size]
+        x2 = x_shuffled[batch_size:batch_size*2]
+        y2 = y_shuffled[batch_size:batch_size*2]
+
+        # 5) 執行標準 Mixup
+        x_mix, y_mix = self.mixup(x1, y1, x2, y2)
+
+        # 6) 前向傳播 + 反向傳播
+        with tf.GradientTape() as tape:
+            preds = self.backbone(x_mix, training=True)
+            loss = self.loss_fn(y_mix, preds)
+
+        grads = tape.gradient(loss, self.backbone.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.backbone.trainable_weights))
+
+        self.train_metric.update_state(loss)
+        return {"loss": self.train_metric.result()}
+
+    # ------------------------ test_step -----------------------
+    def test_step(self, data):
+        x, y = data
+        y = tf.reshape(y, [-1, 1])  # (B,) → (B,1)
+
+        preds = self.backbone(x, training=False)
+        val_loss = self.loss_fn(y, preds)
+
+        self.val_metric.update_state(val_loss)
+        return {"loss": self.val_metric.result()}
+
+    # ------------------------ call ----------------------------
+    def call(self, inputs, training=None):
+        return self.backbone(inputs, training=training)
+
+
+import tensorflow as tf
+import numpy as np
+from tensorflow.keras import Model
+
+class WrapperTCNWithFGSMMixup(Model):
+    """
+    TCN + FGSM + 標準 Mixup (per-example λ，使用 Beta 分布)
+    
+    - look_back, n_features : 交給 backbone 建模
+    - max_num_of_features   : FGSM 注入上限
+    - epsilon               : FGSM 擾動幅度
+    - alpha                 : Mixup 的 Beta(α, α) 參數
+    - step_idx / feat_idx   : 指定 FGSM 注入的時間步 / 特徵 (選填)
+    """
+    def __init__(self,
+                 look_back,
+                 n_features,
+                 max_num_of_features,
+                 epsilon=0.1,
+                 alpha=0.3,
+                 step_idx=None,
+                 feat_idx=None,
+                 model_name=None):
+        super().__init__()
+        self.max_num_of_features = max_num_of_features
+        self.epsilon  = epsilon
+        self.alpha    = alpha
+        self.step_idx = step_idx
+        self.feat_idx = feat_idx
+
+        # 1) 建好 TCN backbone
+        if model_name == 'TCN':
+            self.backbone = build_model_TCN(look_back, n_features)
+        elif model_name == "D-TCN":
+            self.backbone = build_model_double_TCN(look_back, n_features)
+        else:
+            raise ValueError("model_name must be 'TCN' or 'D-TCN'.")
+
+        # 2) 預設 optimizer / loss_fn
+        self.optimizer = tf.keras.optimizers.Adam(1e-3)
+        self.loss_fn   = lambda y_t, y_p: tf.sqrt(
+            tf.reduce_mean(tf.square(y_t - y_p))
+        )
+
+    # ------------------------ compile -------------------------
+    def compile(self, optimizer=None, loss=None, **kwargs):
+        super().compile(run_eagerly=False, **kwargs)
+        if optimizer is not None:
+            self.optimizer = optimizer
+        if loss is not None:
+            self.loss_fn   = loss
+
+        self.train_metric = tf.keras.metrics.Mean(name="train_rmse")
+        self.val_metric   = tf.keras.metrics.Mean(name="val_rmse")
+
+    # ------------------------ FGSM (呼叫 numpy 版) -------------
+    def fgsm_generate(self, x_clean, y_true):
+        def _fgsm_np(x_tf, y_tf):
+            x_np = x_tf.numpy()
+            y_np = y_tf.numpy()
+
+            adv_np = fgsm_inject_one_pos(
+                model   = self.backbone,
+                X_np    = x_np,
+                y_np    = y_np,
+                epsilon = self.epsilon,
+                targeted=False,
+                step_idx=self.step_idx,
+                feat_idx=self.feat_idx,
+                max_num_of_features=self.max_num_of_features
+            )
+            return adv_np.astype(np.float32)
+
+        x_adv = tf.py_function(
+            func=_fgsm_np,
+            inp=[x_clean, y_true],
+            Tout=tf.float32
+        )
+        x_adv.set_shape(x_clean.shape)
+        return x_adv
+
+    # ------------------------ 標準 Mix-up (使用 Beta 分布) -------
+    def mixup(self, x1, y1, x2, y2):
+        """
+        標準 Mixup 實現 (使用 Beta 分布):
+        - 每個樣本有自己的 λ ~ Beta(α, α)
+        - λ 同時應用於輸入和標籤
+        """
+        batch_size = tf.shape(x1)[0]
+        
+        # 1) 產生 per-example λ ~ Beta(α, α) (shape = [batch_size])
+        # 使用 tf.random 的 beta 函數
+        lam = tf.random.uniform(
+            shape=[batch_size], 
+            minval=0, 
+            maxval=1,
+            dtype=x1.dtype
+        )
+        
+        # 使用逆變換採樣生成 Beta 分布
+        # 這比使用 tensorflow_probability 更輕量
+        def sample_beta(u, alpha):
+            # 使用逆變換採樣 Beta(α, α)
+            # 對於對稱 Beta 分布，CDF 的反函數可以簡化
+            return tf.where(
+                u < 0.5,
+                0.5 * tf.pow(2 * u, 1 / alpha),
+                1 - 0.5 * tf.pow(2 * (1 - u), 1 / alpha)
+            )
+        
+        lam = sample_beta(lam, self.alpha)
+        
+        # 2) 擴展維度以匹配輸入和標籤形狀
+        lam_x = tf.reshape(lam, [-1, 1, 1])  # (B, 1, 1) → 用於 (B, T, F)
+        lam_y = tf.reshape(lam, [-1, 1])     # (B, 1)   → 用於 (B, 1)
+        
+        # 3) 執行混合
+        x_mix = lam_x * x1 + (1 - lam_x) * x2
+        y_mix = lam_y * y1 + (1 - lam_y) * y2
+        
+        return x_mix, y_mix
+
+    # ------------------------ train_step (標準 Mixup) -----------
+    def train_step(self, data):
+        """
+        標準 Mixup 訓練步驟:
+        1. 生成對抗樣本
+        2. 將原始樣本和對抗樣本合併
+        3. 打亂後拆分為兩個集合
+        4. 對兩個集合進行 Mixup
+        5. 使用混合數據訓練
+        """
+        x_clean, y_true = data
+        y_true = tf.reshape(y_true, [-1, 1])  # (B,) → (B,1)
+        batch_size = tf.shape(x_clean)[0]
+
+        # 1) 生成對抗樣本 (保持原始標籤)
+        x_adv = self.fgsm_generate(x_clean, y_true)
+
+        # 2) 合併原始樣本和對抗樣本
+        x_all = tf.concat([x_clean, x_adv], axis=0)  # (2B, T, F)
+        y_all = tf.concat([y_true, y_true], axis=0)  # (2B, 1)
+
+        # 3) 打亂整個數據集
+        total_size = 2 * batch_size
+        indices = tf.random.shuffle(tf.range(total_size))
+        x_shuffled = tf.gather(x_all, indices)
+        y_shuffled = tf.gather(y_all, indices)
+
+        # 4) 拆分為兩個集合 (各B個樣本)
+        x1 = x_shuffled[:batch_size]
+        y1 = y_shuffled[:batch_size]
+        x2 = x_shuffled[batch_size:batch_size*2]
+        y2 = y_shuffled[batch_size:batch_size*2]
+
+        # 5) 執行標準 Mixup
+        x_mix, y_mix = self.mixup(x1, y1, x2, y2)
+
+        # 6) 前向傳播 + 反向傳播
+        with tf.GradientTape() as tape:
+            preds = self.backbone(x_mix, training=True)
+            loss = self.loss_fn(y_mix, preds)
+
+        grads = tape.gradient(loss, self.backbone.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.backbone.trainable_weights))
+
+        self.train_metric.update_state(loss)
+        return {"loss": self.train_metric.result()}
+
+    # ------------------------ test_step -----------------------
+    def test_step(self, data):
+        x, y = data
+        y = tf.reshape(y, [-1, 1])  # (B,) → (B,1)
+
+        preds = self.backbone(x, training=False)
+        val_loss = self.loss_fn(y, preds)
 
         self.val_metric.update_state(val_loss)
         return {"loss": self.val_metric.result()}
