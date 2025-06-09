@@ -145,6 +145,27 @@ def train_attack_model(model, X_train, y_train, X_validation, y_validation, epoc
     )
     return history
 
+import matplotlib.pyplot as plt
+
+def plot_perturbation(X_orig, X_adv):
+    plt.figure(figsize=(12,6))
+    
+    # 绘制原始信号
+    plt.subplot(2,1,1)
+    plt.plot(X_orig[0,:,0], label='Original')
+    plt.title('Original Signal')
+    
+    # 绘制扰动差异
+    plt.subplot(2,1,2)
+    plt.plot(X_adv[0,:,0] - X_orig[0,:,0], 'r', label='Perturbation')
+    plt.title('Adversarial Perturbation')
+    plt.ylim(-epsilon*1.1, epsilon*1.1)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+
 
 
 def evaluate_and_attack(model_mixup, model_normal, X_test, y_test, epsilon, step_idx, max_num_of_features, feat_idx=[0, 1, 2]):
@@ -234,33 +255,38 @@ def attack_all_add_pct(X, step_idx=7, feat_idx=[], pct=0.05):
 
 # ==================== 主程式入口 ====================
 
-def main(dt_now):
-    
+def main(dt_now, epsilon, adversial_model_name, attack_method, dataset_name):
     """
         PARAMETERS
     """
+    adversial_model_name = adversial_model_name if adversial_model_name is not None else "mixup"
     look_back = 8
 
-    test_epsilon = 0.2
-    mixup_epsilon = 0.2 #擾動
+    test_epsilon = epsilon if epsilon is not None else 0.2
+    mixup_epsilon = epsilon if epsilon is not None else 0.2
+
 
     mixup_alpha = 0.3 # B
 
     batch_size = 128
     step_idx = look_back - 1
-    feat_idx = [0, 1, 2]
-    model_name = "D-TCN"
+    feat_idx = [0]
+    model_name = "TCN"
     train_ratio = 0.75
     validation_ratio = 0.125
-    max_features = 3
-    target_index = 1
+    max_features = 1
+    target_index = 0
 
-    evalute_above_50percent=True
+    evalute_above_50percent=False
+
     dataset_name = "campus_processed" # campus_processed, Abilene, CERNET
 
-    attack_method = "FGSM" #  FGSM or  normal
+    attack_method = attack_method if attack_method is not None else "FGSM" # FGSM or Normal
 
     only_one_feature = True
+
+
+
 
     if only_one_feature:
         max_features = 1
@@ -275,18 +301,37 @@ def main(dt_now):
     n_features = X_train.shape[2]
     print("current number of features:", n_features)
 
+    mixup_model = None
+    if adversial_model_name == "mixup":
+        mixup_model = build_mixup_model(
+            look_back=look_back,
+            n_features=n_features,
+            epsilon=mixup_epsilon,
+            alpha=mixup_alpha,
+            step_idx=step_idx,
+            feat_idx=feat_idx,
+            model_name=model_name,
+            max_num_of_features=max_features
+        )
+    elif adversial_model_name == "AT":
+        mixup_model = cs.WrapperTCNWithAT(
+            look_back=look_back,
+            n_features=n_features,
+            max_num_of_features=max_features,
+            epsilon=mixup_epsilon,
+            model_name=model_name,
+            step_idx=step_idx,
+            feat_idx=feat_idx,
+            alpha=mixup_alpha
+        )
 
-    # ===== 构建並训练 Mixup 模型 =====
-    mixup_model = build_mixup_model(
-        look_back=look_back,
-        n_features=n_features,
-        epsilon=mixup_epsilon,
-        alpha=mixup_alpha,
-        step_idx=step_idx,
-        feat_idx=feat_idx,
-        model_name=model_name,
-        max_num_of_features=max_features
+    mixup_model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss=lambda y_true, y_pred: tf.sqrt(
+            tf.reduce_mean(tf.square(y_true - y_pred))
+        )  # RMSE
     )
+
     
 
     
@@ -297,6 +342,9 @@ def main(dt_now):
     normal_model = build_normal_model(look_back, n_features, model_name)
     normal_history = train_model(normal_model, X_train, y_train, X_validation, y_validation, epochs=100, batch_size=batch_size)
     #cs.plot_loss(normal_history)
+
+
+    # 使用示例
 
     # ===== 生成對抗樣本並評估 =====
     #epsilon = 0.2
@@ -309,11 +357,12 @@ def main(dt_now):
         # X_test_attacked = attack_all_add_pct(X_test_attacked, step_idx=step_idx, feat_idx=2, pct=test_epsilon)
         X_test_adv_mixup = X_test_attacked.copy()
 
+    # plot_perturbation_at_single_step(X_test, X_test_adv_mixup, target_step=target_index, sample_idx=step_idx)
 
-    # cs.plot_predictions(mixup_model, X_test_adv_mixup, y_test, start=0, end=800, title="Preidcted by Mixup model, FGSM by Mixup model")
-    # cs.plot_predictions(mixup_model, X_test, y_test, start=0, end=800, title="Predicted Mixup model, Non-attack Input")
-    # cs.plot_predictions(normal_model, X_test_adv_mixup, y_test, start=0, end=800, title="Preidcted by Normal model, FGSM by Mixup model")
-    # cs.plot_predictions(normal_model, X_test, y_test, start=0, end=800, title="Preidcted by Normal model, Non-attack Input")
+    cs.plot_predictions(mixup_model, X_test_adv_mixup, y_test, start=0, end=800, title="Preidcted by Mixup model, Input: FGSM inject.")
+    cs.plot_predictions(mixup_model, X_test, y_test, start=0, end=800, title="Predicted Mixup model, Non-attack Input")
+    cs.plot_predictions(normal_model, X_test_adv_mixup, y_test, start=0, end=800, title="Preidcted by Normal model, Input: FGSM inject.")
+    cs.plot_predictions(normal_model, X_test, y_test, start=0, end=800, title="Preidcted by Normal model, Non-attack Input")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_path = os.path.join(script_dir, '..', '..', 'outputs', 'logs', f"log{dt_now}.txt")
@@ -346,6 +395,6 @@ def main(dt_now):
 
 if __name__ == '__main__':
     dt = datetime.now()
-    for i in range(10):
+    for i in range(1):
         print(i)
         main(dt)
