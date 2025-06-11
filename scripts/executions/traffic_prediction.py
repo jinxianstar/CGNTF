@@ -24,7 +24,7 @@ def load_data(n_steps, target_index, dataset_name, only_one_feature):
     # 获取当前脚本文件的位置
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_path = os.path.join(script_dir, '..', '..', 'data', 'processed', f"{dataset_name}.csv")
-    
+
     df = pd.read_csv(data_path)
     if "campus" in dataset_name:
         df = df.set_index('DateTime')
@@ -255,7 +255,7 @@ def attack_all_add_pct(X, step_idx=7, feat_idx=[], pct=0.05):
 
 # ==================== 主程式入口 ====================
 
-def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name):
+def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, at_mixed=False):
     """
         PARAMETERS
     """
@@ -322,7 +322,8 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name):
             model_name=model_name,
             step_idx=step_idx,
             feat_idx=feat_idx,
-            alpha=mixup_alpha
+            alpha= mixup_alpha,
+            mixed = at_mixed
         )
         mixup_model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
@@ -394,9 +395,14 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name):
 
 if __name__ == '__main__':
     attack_methods = ["FGSM", "Normal"]
-    epsilons = [0.1, 0.2]
-    datasets = ["campus_processed", "CERNET"]
-    adversarial_model_names = ["mixup", "AT"]
+    epsilons = [0.05, 0.13]
+    #epsilons = [0.2]
+
+    datasets = ["campus_processed"] #"CERNET"]
+    adversarial_model_names = ["AT", "mixup"]
+    #adversarial_model_names = ["AT"]
+    at_mixed = False
+
     times = 10
 
     for dataset in datasets:
@@ -405,10 +411,12 @@ if __name__ == '__main__':
                 for adversarial_model_name in adversarial_model_names:
                     dt = datetime.now()
                     for i in range(times):
+                        print(dataset)
                         main(
                             dt_now=dt, 
                             epsilon=epsilon, 
                             adversarial_model_name=adversarial_model_name, 
                             attack_method=attack_method,
-                            dataset_name=dataset     
+                            dataset_name=dataset, 
+                            at_mixed=at_mixed     
                         )

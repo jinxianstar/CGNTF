@@ -758,13 +758,16 @@ class WrapperTCNWithAT(Model):
                  step_idx=None,
                  feat_idx=None,
                  model_name=None,
-                 alpha=0.5):  # 新增：对抗样本与原始样本的混合权重
+                 alpha=0.5,
+                 mixed = False
+                 ):  # 新增：对抗样本与原始样本的混合权重
         super().__init__()
         self.max_num_of_features = max_num_of_features
         self.epsilon  = epsilon
         self.step_idx = step_idx
         self.feat_idx = feat_idx
         self.alpha = alpha  # 控制对抗样本的混合比例 (0.0~1.0)
+        self.mixed = mixed
 
         # 1) 建好 TCN backbone
         if model_name == 'TCN':
@@ -832,15 +835,20 @@ class WrapperTCNWithAT(Model):
         # 1. 生成對抗樣本 (保持原始標籤)
         x_adv = self.fgsm_generate(x_clean, y_true)
 
-        # 2. 混合原始樣本與對抗樣本 (按權重 alpha)
-        # 注意：这里采用论文 AT-TDNS 的加权混合策略
-        # x_mixed = self.alpha * x_adv + (1 - self.alpha) * x_clean
-        # y_mixed = y_true  # 标签保持不变（回归任务无标签翻转）
+        #2. 混合原始樣本與對抗樣本 (按權重 alpha)
+        #注意：这里采用论文 AT-TDNS 的加权混合策略
+        if self.mixed == True:
+            x_mixed = self.alpha * x_adv + (1 - self.alpha) * x_clean
+            y_mixed = y_true  # 标签保持不变（回归任务无标签翻转）
 
-        # 3. 前向傳播 + 反向傳播
-        with tf.GradientTape() as tape:
-            preds = self.backbone(x_adv, training=True)
-            loss = self.loss_fn(y_true, preds)
+            with tf.GradientTape() as tape:
+                preds = self.backbone(x_mixed, training=True)
+                loss = self.loss_fn(y_mixed, preds)
+        else:
+            # 3. 前向傳播 + 反向傳播
+            with tf.GradientTape() as tape:
+                preds = self.backbone(x_adv, training=True)
+                loss = self.loss_fn(y_true, preds)
 
         grads = tape.gradient(loss, self.backbone.trainable_weights)
         self.optimizer.apply_gradients(zip(grads, self.backbone.trainable_weights))
