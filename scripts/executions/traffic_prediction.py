@@ -212,7 +212,7 @@ def report_results(model, X_test, y_test, above_half_range):
         return cs.evaluate_regression(y_test, predicted)
 
 
-def attack_all_add_pct(X, step_idx=7, feat_idx=[], pct=0.05):
+def attack_all_add_delta(X, step_idx=7, feat_idx=[], delta=0.2):
     """
     对 X 中所有样本，在指定的 step_idx 和 feat_idx 位置，
     将原值增加 pct * 原值（即乘以 1+pct）。
@@ -228,7 +228,7 @@ def attack_all_add_pct(X, step_idx=7, feat_idx=[], pct=0.05):
     """
     X_attacked = X.copy()
     for i in feat_idx:
-        X_attacked[:, step_idx, i] *= (1 + pct)
+        X_attacked[:, step_idx, i] += delta
     return X_attacked
 
 
@@ -353,8 +353,7 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, a
         _, X_test_adv_mixup = evaluate_and_attack(mixup_model, normal_model, X_test, y_test, test_epsilon, step_idx=step_idx, feat_idx=feat_idx, max_num_of_features=max_features)
     
     elif attack_method == "Normal": # 固定黑盒式擾動
-        X_test_attacked = attack_all_add_pct(X_test, step_idx=step_idx, feat_idx=feat_idx, pct=test_epsilon)
-        # X_test_attacked = attack_all_add_pct(X_test_attacked, step_idx=step_idx, feat_idx=2, pct=test_epsilon)
+        X_test_attacked = attack_all_add_delta(X_test, step_idx=step_idx, feat_idx=feat_idx, delta=test_epsilon)
         X_test_adv_mixup = X_test_attacked.copy()
 
     # plot_perturbation_at_single_step(X_test, X_test_adv_mixup, target_step=target_index, sample_idx=step_idx)
