@@ -90,7 +90,7 @@ MODELS
 
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
+from tensorflow.keras.layers import Dense, Flatten
 from tcn import TCN  # Make sure you have installed the tcn package
 from keras.layers import Conv1D, LSTM, MaxPooling1D
 

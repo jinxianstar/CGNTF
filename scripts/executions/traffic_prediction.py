@@ -103,6 +103,12 @@ def build_normal_model(look_back, n_features, model_name):
     '''original models.'''
     if model_name == "TCN":
         return cs.build_model_TCN(look_back, n_features)
+    elif model_name == "CNN-LSTM":
+        return cs.build_model_CNN_LSTM(look_back, n_features)
+    elif model_name == "CNN-GRU":
+        return cs.build_model_GRU_with_Conv1D(look_back, n_features)
+    elif model_name == "LSTM":
+        return cs.build_model_LSTM(look_back, n_features)
     elif model_name == "D-TCN":
         return cs.build_model_double_TCN(look_back, n_features)
 
@@ -259,7 +265,7 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, a
     """
         PARAMETERS
     """
-    adversarial_model_name = adversarial_model_name if adversarial_model_name is not None else "mixup"
+    adversarial_model_name = adversarial_model_name if adversarial_model_name is not None else "AT"
     look_back = 8
 
     test_epsilon = epsilon if epsilon is not None else 0.2
@@ -272,8 +278,8 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, a
     step_idx = look_back - 1
     feat_idx = [0]
     model_name = "TCN"
-    train_ratio = 0.75
-    validation_ratio = 0.125
+    train_ratio = 0.7
+    validation_ratio = 0.15 #目前修改 暫時修改 之後要改回來喔！！
     max_features = 1
     target_index = 0
 
@@ -301,9 +307,9 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, a
     n_features = X_train.shape[2]
     print("current number of features:", n_features)
 
-    mixup_model = None
+    adversarial_model = None
     if adversarial_model_name == "mixup":
-        mixup_model = build_mixup_model(
+        adversarial_model = build_mixup_model(
             look_back=look_back,
             n_features=n_features,
             epsilon=mixup_epsilon,
@@ -314,7 +320,7 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, a
             max_num_of_features=max_features
         )
     elif adversarial_model_name == "AT":
-        mixup_model = cs.WrapperTCNWithAT(
+        adversarial_model = cs.WrapperTCNWithAT(
             look_back=look_back,
             n_features=n_features,
             max_num_of_features=max_features,
@@ -325,7 +331,7 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, a
             alpha= mixup_alpha,
             mixed = at_mixed
         )
-        mixup_model.compile(
+        adversarial_model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
             loss=lambda y_true, y_pred: tf.sqrt(
                 tf.reduce_mean(tf.square(y_true - y_pred))
@@ -335,11 +341,11 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, a
     
 
     
-    mixup_history = train_model(mixup_model, X_train, y_train, X_validation, y_validation, epochs=100, batch_size=batch_size)
+    mixup_history = train_model(adversarial_model, X_train, y_train, X_validation, y_validation, epochs=100, batch_size=batch_size)
     #cs.plot_loss(mixup_history)
 
     # ===== 构建並训练普通模型 =====
-    normal_model = build_normal_model(look_back, n_features, model_name)
+    normal_model = build_normal_model(look_back, n_features, model_name) #需要改回 model_name
     normal_history = train_model(normal_model, X_train, y_train, X_validation, y_validation, epochs=100, batch_size=batch_size)
     #cs.plot_loss(normal_history)
 
@@ -350,7 +356,7 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, a
     #epsilon = 0.2
     # FGSM + Mixup 擾動
     if attack_method == "FGSM":
-        _, X_test_adv_mixup = evaluate_and_attack(mixup_model, normal_model, X_test, y_test, test_epsilon, step_idx=step_idx, feat_idx=feat_idx, max_num_of_features=max_features)
+        _, X_test_adv_mixup = evaluate_and_attack(adversarial_model, normal_model, X_test, y_test, test_epsilon, step_idx=step_idx, feat_idx=feat_idx, max_num_of_features=max_features)
     
     elif attack_method == "Normal": # 固定黑盒式擾動
         X_test_attacked = attack_all_add_delta(X_test, step_idx=step_idx, feat_idx=feat_idx, delta=test_epsilon)
@@ -358,11 +364,14 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, a
 
     # plot_perturbation_at_single_step(X_test, X_test_adv_mixup, target_step=target_index, sample_idx=step_idx)
 
-    # cs.plot_predictions(mixup_model, X_test_adv_mixup, y_test, start=0, end=800, title="Preidcted by Mixup model, Input: FGSM inject.")
-    # cs.plot_predictions(mixup_model, X_test, y_test, start=0, end=800, title="Predicted Mixup model, Non-attack Input")
-    # cs.plot_predictions(normal_model, X_test_adv_mixup, y_test, start=0, end=800, title="Preidcted by Normal model, Input: FGSM inject.")
-    # cs.plot_predictions(normal_model, X_test, y_test, start=0, end=800, title="Preidcted by Normal model, Non-attack Input")
-
+    """
+    start = 400
+    end = 500
+    cs.plot_predictions(adversarial_model, X_test_adv_mixup, y_test, start=start, end=end, title="Preidcted by Mixup model, Input: FGSM inject.")
+    cs.plot_predictions(adversarial_model, X_test, y_test, start=start, end=end, title="Predicted Mixup model, Non-attack Input")
+    cs.plot_predictions(normal_model, X_test_adv_mixup, y_test, start=start, end=end, title="Preidcted by Normal model, Input: FGSM inject.")
+    cs.plot_predictions(normal_model, X_test, y_test, start=start, end=end, title="Preidcted by Normal model, Non-attack Input")
+    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_path = os.path.join(script_dir, '..', '..', 'outputs', 'logs', f"log{dt_now}.txt")
 
@@ -375,9 +384,9 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, a
             print("=============================================")
             print('Mixup Method')
             print('以下：未擾動')
-            report_results(mixup_model, X_test, y_test, evalute_above_50percent)
+            report_results(adversarial_model, X_test, y_test, evalute_above_50percent)
             print('以下：擾動')
-            report_results(mixup_model, X_test_adv_mixup, y_test, evalute_above_50percent)
+            report_results(adversarial_model, X_test_adv_mixup, y_test, evalute_above_50percent)
             print("---------------------------------------------")
             print('Normal Method')
             print('以下：未擾動')
@@ -393,11 +402,19 @@ def main(dt_now, epsilon, adversarial_model_name, attack_method, dataset_name, a
 
 
 if __name__ == '__main__':
+    # dt = datetime.now()
+    # main(
+    #     dt_now=dt, 
+    #     epsilon=0.2, 
+    #     adversarial_model_name="AT", 
+    #     attack_method="FGSM",
+    #     dataset_name="campus_processed", 
+    #     at_mixed=False
+    # )
     attack_methods = ["FGSM", "Normal"]
-    epsilons = [0.05, 0.13]
-    #epsilons = [0.2]
+    epsilons = [0.06, 0.09, 0.15, 0.2]
 
-    datasets = ["campus_processed"] #"CERNET"]
+    datasets = ["Abilene"]
     adversarial_model_names = ["AT", "mixup"]
     #adversarial_model_names = ["AT"]
     at_mixed = False
@@ -417,5 +434,5 @@ if __name__ == '__main__':
                             adversarial_model_name=adversarial_model_name, 
                             attack_method=attack_method,
                             dataset_name=dataset, 
-                            at_mixed=at_mixed     
+                            at_mixed=at_mixed
                         )
