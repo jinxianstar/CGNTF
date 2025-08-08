@@ -163,6 +163,51 @@ def build_model_TCN(look_back, n_features):
     return model
 
 
+import shap
+
+def explain_with_kernel(model, 
+                        X_train, 
+                        X_explain, 
+                        background_samples: int = 100,
+                        nsamples: int = 200):
+    """
+    用 KernelExplainer 对任意模型做 SHAP 解释（适用于不支持梯度的场景）。
+
+    参数:
+    - model: 已训练好的模型，要求有 .predict 接口，输入形状 (batch, look_back, n_features)
+    - X_train: 训练集数组，形状 (N, look_back, n_features)
+    - X_explain: 待解释样本，形状 (M, look_back, n_features)
+    - background_samples: 用于背景集的样本数，越多越精确但越慢
+    - nsamples: KernelExplainer 内部蒙版采样数，越多越精确但越慢
+
+    返回:
+    - explainer: shap.KernelExplainer 对象
+    - shap_vals: SHAP 值，列表或数组，形状 (M, look_back*n_features)
+    """
+    # 自动推断时序长度和特征数
+    _, look_back, n_features = X_train.shape
+
+    # 1) 展平训练集并随机抽取背景
+    X_flat = X_train.reshape((X_train.shape[0], look_back * n_features))
+    idx = np.random.choice(X_flat.shape[0], background_samples, replace=False)
+    background = X_flat[idx]
+
+    # 2) 定义预测函数，接收展平后的输入
+    def f(x_flat: np.ndarray):
+        x = x_flat.reshape((x_flat.shape[0], look_back, n_features))
+        return model.predict(x).flatten()
+
+    # 3) 初始化 KernelExplainer
+    explainer = shap.KernelExplainer(f, background)
+
+    # 4) 对待解释样本展平并计算 SHAP 值
+    X_explain_flat = X_explain.reshape((X_explain.shape[0], look_back * n_features))
+    shap_vals = explainer.shap_values(X_explain_flat, nsamples=nsamples)
+
+    return explainer, shap_vals
+
+
+
 
 
 def build_model_LSTM(look_back, n_features):
@@ -479,9 +524,9 @@ def fgsm_inject_one_pos(
         preds = model(X_var, training=False)
         loss = loss_fn(y_tf, preds)
         if targeted:
-            loss = -loss  # 定向攻击：让预测更“贴近” y_np
+            loss = -loss  # 定向攻击：让预测更“贴近” y_np （梯度下降到特定目標）
 
-    grad = tape.gradient(loss, X_var).numpy()
+    grad = tape.gradient(loss, X_var).numpy() #每個特徵的變化速率
     grad_sign = np.sign(grad)  # 取符号：-1, 0, +1
 
     # -------- 3.1 只保留正方向扰动，将负号和 0 都置为 0 --------
@@ -500,7 +545,7 @@ def fgsm_inject_one_pos(
             mask[:, step_idx, feat_idx] = 1.0
 
         # 只会在 grad_pos 为 1 的位置，叠加 +epsilon
-        X_adv = X_adv + epsilon * (grad_pos * mask)
+        X_adv = X_adv + epsilon * (grad_pos * mask) # epsilon *導數 就可以得到干擾嗎
 
     else:
         # “全局”扰动：针对所有样本，所有 time step / 所有位置的前 3 列
@@ -516,6 +561,326 @@ def fgsm_inject_one_pos(
         X_adv = X_adv + epsilon * (grad_pos * mask)
 
     return X_adv
+
+
+import numpy as np
+import tensorflow as tf
+
+def fgsm_inject_one_pos(
+    model, X_np, y_np, epsilon,
+    targeted=False, step_idx=None, feat_idx=None, num_perturb_features=3
+):
+    """
+    基于 FGSM 的单点/多点注入扰动函数（只做“增加”扰动，不做“减少”）。
+    - model: tf.keras.Model，输出形状需与 y_np 一致
+    - X_np: numpy.ndarray，shape=(batch_size, time_steps, num_features) 或 (batch_size, num_features)
+    - y_np: numpy.ndarray，shape 与 model(X).numpy() 匹配
+    - epsilon: 扰动幅度（float）
+    - targeted: 是否做定向攻击；False 表示 untargeted（最大化 loss），True 表示定向（最小化 loss）
+    - step_idx: int or None，当 None 时做“全局”扰动；否则做“定点”扰动（只针对 timestep=step_idx）
+    - feat_idx: int or list/ndarray or None，当 None 时做“全局”扰动
+    - num_perturb_features: int，要扰动的前 N 列（只在全局模式下生效）
+    """
+
+    # 1. 转换并复制输入
+    X_adv = X_np.astype(np.float32).copy()
+    X_var = tf.Variable(X_adv)
+    y_tf = tf.convert_to_tensor(y_np, dtype=tf.float32)
+
+    # 2. 计算梯度
+    loss_fn = tf.keras.losses.MeanSquaredError()
+    with tf.GradientTape() as tape:
+        tape.watch(X_var)
+        preds = model(X_var, training=False)
+        loss = loss_fn(y_tf, preds)
+        if targeted:
+            loss = -loss
+    grad = tape.gradient(loss, X_var).numpy()
+
+    # 3. 仅保留能够增加损失的正向梯度方向
+    grad_pos = (np.sign(grad) > 0).astype(np.float32)
+
+    # 4. 断言输入维度
+    assert X_adv.ndim in (2, 3), f"只支持 2D/3D 输入，当前 ndim={X_adv.ndim}"
+
+    # 5. 构建全局扰动 mask
+    mask = np.zeros_like(grad_pos)
+    feature_count = X_adv.shape[-1]
+    assert num_perturb_features <= feature_count, (
+        f"num_perturb_features({num_perturb_features}) 超出特征数({feature_count})"
+    )
+    if X_adv.ndim == 3:
+        # (batch_size, time_steps, num_features)
+        mask[..., :num_perturb_features] = 1.0
+    else:
+        # (batch_size, num_features)
+        mask[:, :num_perturb_features] = 1.0
+
+    # 6. 定点注入模式下覆盖 mask
+    if step_idx is not None and feat_idx is not None:
+        if X_adv.ndim == 3:
+            time_steps = X_adv.shape[1]
+            num_feats = X_adv.shape[2]
+            assert 0 <= step_idx < time_steps, f"step_idx({step_idx}) 越界"
+            if isinstance(feat_idx, (list, tuple, np.ndarray)):
+                assert 0 <= min(feat_idx) and max(feat_idx) < num_feats, (
+                    f"feat_idx({feat_idx}) 越界"
+                )
+            else:
+                assert 0 <= feat_idx < num_feats, f"feat_idx({feat_idx}) 越界"
+            submask = np.zeros_like(mask)
+            submask[:, step_idx, feat_idx] = 1.0
+        else:
+            num_feats = X_adv.shape[1]
+            assert isinstance(feat_idx, int) and 0 <= feat_idx < num_feats, (
+                f"feat_idx({feat_idx}) 越界"
+            )
+            submask = np.zeros_like(mask)
+            submask[:, feat_idx] = 1.0
+        mask = submask
+
+    # 7. 应用扰动
+    X_adv = X_adv + epsilon * grad_pos * mask
+
+    # 8. （可选）根据需要裁剪到合理范围
+    # X_adv = np.clip(X_adv, min_val, max_val)
+
+    return X_adv
+
+
+
+def fgsm_inject_one_pos(
+    model, X_np, y_np, epsilon,
+    targeted=False, step_idx=None, feat_idx=None, max_num_of_features=3
+):
+    """
+    基于 FGSM 的单点/多点注入扰动函数（只做“增加”扰动，不做“减少”）。
+    
+    参数:
+    - model: tf.keras.Model，输出形状需与 y_np 一致
+    - X_np: numpy.ndarray，shape=(batch_size, time_steps, num_features) 或 (batch_size, num_features)
+    - y_np: numpy.ndarray，shape 与 model(X).numpy() 匹配
+    - epsilon: 扰动幅度（float）
+    - targeted: bool，是否做定向攻击；False 表示 untargeted（最大化 loss），True 表示定向（最小化 loss）
+    - step_idx: int or None，当 None 时做“全局”扰动；否则做“定点”扰动（只针对 timestep=step_idx）
+    - feat_idx: int or list/ndarray or None，当 None 时做“全局”扰动
+    - max_num_of_features: int，全局扰动时“前 N 列”扰动的特征数
+    """
+    # 1. 转成 float32、声明为 tf.Variable
+    X_adv = X_np.copy().astype(np.float32)
+    X_var = tf.Variable(X_adv)
+
+    # 2. 强转标签为 tf.Tensor，确保 dtype 一致
+    y_tf = tf.convert_to_tensor(y_np, dtype=tf.float32)
+
+    # 3. 计算梯度
+    loss_fn = tf.keras.losses.MeanSquaredError()
+    with tf.GradientTape() as tape:
+        tape.watch(X_var)
+        preds = model(X_var, training=False)
+        loss = loss_fn(y_tf, preds)
+        if targeted:
+            loss = -loss  # 定向攻击：让预测更“贴近” y_np （梯度下降到特定目标）
+    grad = tape.gradient(loss, X_var).numpy()
+    grad_sign = np.sign(grad)
+
+    # 3.1 只保留正方向扰动，将负号和 0 都置为 0
+    grad_pos = np.where(grad_sign > 0, 1.0, 0.0)
+
+    # 4. 应用扰动（仅往上增加）
+    if (step_idx is not None) and (feat_idx is not None):
+        # 定点扰动：只针对特定 time step 和特征列
+        mask = np.zeros_like(grad_pos)
+        if isinstance(feat_idx, (list, tuple, np.ndarray)):
+            mask[:, step_idx, feat_idx] = 1.0
+        else:
+            mask[:, step_idx, feat_idx] = 1.0
+        X_adv = X_adv + epsilon * (grad_pos * mask)
+    else:
+        # 全局扰动：针对所有样本，所有 time step / 所有位置的前 N 列
+        # 如果输入是一维向量，先扩展为 batch 维度
+        if X_adv.ndim == 1:
+            X_adv = X_adv[np.newaxis, ...]
+            X_var = tf.Variable(X_adv)
+            grad_pos = grad_pos[np.newaxis, ...]
+
+        mask = np.zeros_like(grad_pos)
+        if mask.ndim == 3:
+            # (batch_size, time_steps, num_features)
+            mask[..., :max_num_of_features] = 1.0
+        elif mask.ndim == 2:
+            # (batch_size, num_features)
+            mask[:, :max_num_of_features] = 1.0
+        else:
+            raise ValueError(
+                f"只支持 2D 或 3D 输入，收到 {mask.ndim}D，无法按前 {max_num_of_features} 列做扰动。"
+            )
+        X_adv = X_adv + epsilon * (grad_pos * mask)
+
+    return X_adv
+
+
+
+def pgd_inject_one_pos(
+    model, X_np, y_np, *,
+    epsilon,            # 最大總擾動幅度 (L∞)
+    alpha=0.01,         # 每一步的 step size
+    num_iter=40,        # 迭代次數
+    targeted=False,
+    step_idx=None,
+    feat_idx=None,
+    max_num_of_features=3
+):
+    # -------- 1. 初始化 --------
+    X_orig = X_np.astype(np.float32)
+    X_adv  = X_orig.copy()
+    y_tf   = tf.convert_to_tensor(y_np, dtype=tf.float32)
+
+    # 預先計算 mask（決定要擾動的位置）
+    mask = np.zeros_like(X_orig, dtype=np.float32)
+
+    if (step_idx is not None) and (feat_idx is not None):
+        # 定點擾動
+        if isinstance(feat_idx, (list, tuple, np.ndarray)):
+            mask[:, step_idx, feat_idx] = 1.0
+        else:
+            mask[:, step_idx, feat_idx] = 1.0
+    else:
+        # 全域擾動：僅前 max_num_of_features 列
+        if mask.ndim == 3:  # 修正：明確判斷維度
+            mask[..., :max_num_of_features] = 1.0
+        elif mask.ndim == 2:
+            mask[:, :max_num_of_features] = 1.0
+        else:
+            raise ValueError("X_np 的維度既不是 2 也不是 3，無法按前幾列做擾動。")
+
+    # -------- 2. PGD 迭代 --------
+    loss_fn = tf.keras.losses.MeanSquaredError()
+
+    for _ in range(num_iter):
+        # 2.1 計算梯度
+        X_var = tf.Variable(X_adv)
+        with tf.GradientTape() as tape:
+            tape.watch(X_var)
+            preds = model(X_var, training=False)
+            loss  = loss_fn(y_tf, preds)
+            if targeted:
+                loss = -loss
+
+        grad = tape.gradient(loss, X_var)
+        if grad is None:
+            break  # 避免梯度為None時出錯
+            
+        grad_np = grad.numpy()
+        grad_sign = np.sign(grad_np)
+        grad_pos = np.where(grad_sign > 0, 1.0, 0.0)
+
+        # 2.2 單步更新（只在mask位置應用擾動）
+        # 關鍵修改：直接將mask應用到擾動上
+        perturbation = alpha * (grad_pos * mask)
+        X_adv = X_adv + perturbation
+
+        # 2.3 投影到擾動範圍 [X_orig, X_orig + epsilon]
+        # 關鍵修改：只在mask位置限制擾動範圍
+        delta = X_adv - X_orig
+        # 只在mask位置進行裁剪
+        clipped_delta = np.clip(delta, 0.0, epsilon)
+        # 非mask位置保持原始值
+        X_adv = X_orig + np.where(mask > 0, clipped_delta, delta)
+
+    return X_adv
+
+
+def pgd_inject_one_pos(
+    model, X_np, y_np, *,
+    epsilon,                  # 最大总扰动幅度 (L∞)
+    alpha=0.01,               # 每一步的 step size
+    num_iter=40,              # 迭代次数
+    targeted=False,           
+    step_idx=None,            
+    feat_idx=None,            
+    max_num_of_features=3     
+):
+    """
+    基于 PGD 的“只增不减”注入扰动（L∞ 约束）。
+    - model: tf.keras.Model，输出形状需与 y_np 匹配
+    - X_np: np.ndarray, shape=(batch, time_steps, features) 或 (batch, features)
+    - y_np: np.ndarray, 与 model(X) 的输出一致
+    - epsilon: 最大扰动幅度
+    - alpha: 步长
+    - num_iter: 迭代轮数
+    - targeted: 是否做定向攻击
+    - step_idx, feat_idx: 指定单点注入；否则做全局前 max_num_of_features 列
+    """
+    # 1. 准备
+    X_orig = X_np.astype(np.float32)
+    X_adv  = X_orig.copy()
+    y_tf   = tf.convert_to_tensor(y_np, dtype=tf.float32)
+
+    # 2. 检查并构建 mask
+    assert X_adv.ndim in (2, 3), f"仅支持 2D 或 3D 输入，当前 ndim={X_adv.ndim}"
+    feat_count = X_adv.shape[-1]
+    assert max_num_of_features <= feat_count, (
+        f"max_num_of_features ({max_num_of_features}) 超出特征数 ({feat_count})"
+    )
+    mask = np.zeros_like(X_adv, dtype=np.float32)
+
+    if step_idx is not None and feat_idx is not None:
+        # 定点扰动
+        if X_adv.ndim == 3:
+            time_steps = X_adv.shape[1]
+            assert 0 <= step_idx < time_steps, f"step_idx ({step_idx}) 越界"
+            if isinstance(feat_idx, (list, tuple, np.ndarray)):
+                assert min(feat_idx) >= 0 and max(feat_idx) < feat_count, f"feat_idx ({feat_idx}) 越界"
+                mask[:, step_idx, feat_idx] = 1.0
+            else:
+                assert 0 <= feat_idx < feat_count, f"feat_idx ({feat_idx}) 越界"
+                mask[:, step_idx, feat_idx] = 1.0
+        else:
+            # 2D 输入
+            if isinstance(feat_idx, (list, tuple, np.ndarray)):
+                raise ValueError("2D 输入时 feat_idx 必须是单个整数")
+            assert 0 <= feat_idx < feat_count, f"feat_idx ({feat_idx}) 越界"
+            mask[:, feat_idx] = 1.0
+    else:
+        # 全局扰动：前 max_num_of_features 列
+        if X_adv.ndim == 3:
+            mask[..., :max_num_of_features] = 1.0
+        else:
+            mask[:, :max_num_of_features] = 1.0
+
+    # 3. PGD 迭代
+    loss_fn = tf.keras.losses.MeanSquaredError()
+    for _ in range(num_iter):
+        X_var = tf.Variable(X_adv)
+        with tf.GradientTape() as tape:
+            tape.watch(X_var)
+            preds = model(X_var, training=False)
+            loss = loss_fn(y_tf, preds)
+            if targeted:
+                loss = -loss
+        grad = tape.gradient(loss, X_var)
+        if grad is None:
+            raise RuntimeError("梯度为 None，无法继续迭代")
+        grad_np = grad.numpy()
+
+        # 只保留正向梯度（只增不减）
+        grad_pos = (np.sign(grad_np) > 0).astype(np.float32)
+
+        # 单步更新：仅在 mask 区域添加扰动
+        perturb = alpha * (grad_pos * mask)
+        X_adv = X_adv + perturb
+
+        # 投影：保持 delta ∈ [0, ε] 且仅限 mask 区域
+        delta = X_adv - X_orig
+        clipped = np.clip(delta, 0.0, epsilon)
+        # 非 mask 区域的 delta 恢复为 0
+        delta = np.where(mask > 0, clipped, 0.0)
+        X_adv = X_orig + delta
+
+    return X_adv
+
+
 
 
 
@@ -575,17 +940,20 @@ class WrapperTCNWithFGSMMixup(Model):
                  look_back,
                  n_features,
                  max_num_of_features,
+                 attack_method,
                  epsilon=0.1,
                  alpha=0.3,
                  step_idx=None,
                  feat_idx=None,
-                 model_name=None):
+                 model_name=None,
+                 ):
         super().__init__()
         self.max_num_of_features = max_num_of_features
         self.epsilon  = epsilon
         self.alpha    = alpha
         self.step_idx = step_idx
         self.feat_idx = feat_idx
+        self.attack_method = attack_method
 
         # 1) 建好 TCN backbone
         if model_name == 'TCN':
@@ -618,16 +986,28 @@ class WrapperTCNWithFGSMMixup(Model):
             x_np = x_tf.numpy()
             y_np = y_tf.numpy()
 
-            adv_np = fgsm_inject_one_pos(
-                model   = self.backbone,
-                X_np    = x_np,
-                y_np    = y_np,
-                epsilon = self.epsilon,
-                targeted=False,
-                step_idx=self.step_idx,
-                feat_idx=self.feat_idx,
-                max_num_of_features=self.max_num_of_features
-            )
+            if self.attack_method == "FGSM":
+                adv_np = fgsm_inject_one_pos(
+                    model   = self.backbone,
+                    X_np    = x_np,
+                    y_np    = y_np,
+                    epsilon = self.epsilon,
+                    targeted=False,
+                    step_idx=self.step_idx,
+                    feat_idx=self.feat_idx,
+                    max_num_of_features=self.max_num_of_features
+                )
+            if self.attack_method == "PGD":
+                adv_np = pgd_inject_one_pos(
+                    model = self.backbone,
+                    X_np = x_np,
+                    y_np = y_np,
+                    epsilon=self.epsilon,                      # ✅ 改這裡
+                    num_iter=40,                   # ✅ 一定要補上這個，因為沒有預設值
+                    step_idx=self.step_idx,
+                    feat_idx=(self.feat_idx if self.feat_idx is not None else None),
+                    max_num_of_features=self.max_num_of_features
+                )
             return adv_np.astype(np.float32)
 
         x_adv = tf.py_function(
@@ -759,7 +1139,8 @@ class WrapperTCNWithAT(Model):
                  feat_idx=None,
                  model_name=None,
                  alpha=0.5,
-                 mixed = False
+                 mixed = False,
+                 attack_method = "FGSM",
                  ):  # 新增：对抗样本与原始样本的混合权重
         super().__init__()
         self.max_num_of_features = max_num_of_features
@@ -768,6 +1149,7 @@ class WrapperTCNWithAT(Model):
         self.feat_idx = feat_idx
         self.alpha = alpha  # 控制对抗样本的混合比例 (0.0~1.0)
         self.mixed = mixed
+        self.attack_method = attack_method
 
         # 1) 建好 TCN backbone
         if model_name == 'TCN':
@@ -800,16 +1182,29 @@ class WrapperTCNWithAT(Model):
             x_np = x_tf.numpy()
             y_np = y_tf.numpy()
 
-            adv_np = fgsm_inject_one_pos(
-                model   = self.backbone,
-                X_np    = x_np,
-                y_np    = y_np,
-                epsilon = self.epsilon,
-                targeted=False,
-                step_idx=self.step_idx,
-                feat_idx=self.feat_idx,
-                max_num_of_features=self.max_num_of_features
-            )
+            if self.attack_method == "FGSM":
+                adv_np = fgsm_inject_one_pos(
+                    model   = self.backbone,
+                    X_np    = x_np,
+                    y_np    = y_np,
+                    epsilon = self.epsilon,
+                    targeted=False,
+                    step_idx=self.step_idx,
+                    feat_idx=self.feat_idx,
+                    max_num_of_features=self.max_num_of_features
+                )
+            if self.attack_method == "PGD":
+                adv_np = pgd_inject_one_pos(
+                    model = self.backbone,
+                    X_np = x_np,
+                    y_np = y_np,
+                    epsilon=self.epsilon,                      # ✅ 改這裡
+                    num_iter=20,                   # ✅ 一定要補上這個，因為沒有預設值
+                    step_idx=self.step_idx,
+                    feat_idx=(self.feat_idx if self.feat_idx is not None else None),
+                    max_num_of_features=self.max_num_of_features
+
+                )
             return adv_np.astype(np.float32)
 
         x_adv = tf.py_function(
@@ -835,8 +1230,7 @@ class WrapperTCNWithAT(Model):
         # 1. 生成對抗樣本 (保持原始標籤)
         x_adv = self.fgsm_generate(x_clean, y_true)
 
-        #2. 混合原始樣本與對抗樣本 (按權重 alpha)
-        #注意：这里采用论文 AT-TDNS 的加权混合策略
+        #2. Mixed or not 
         if self.mixed == True:
             x_mixed = self.alpha * x_adv + (1 - self.alpha) * x_clean
             y_mixed = y_true  # 标签保持不变（回归任务无标签翻转）
@@ -868,5 +1262,255 @@ class WrapperTCNWithAT(Model):
         return {"loss": self.val_metric.result()}
 
     # ------------------------ call ----------------------------
+    def call(self, inputs, training=None):
+        return self.backbone(inputs, training=training)
+
+
+
+
+import numpy as np
+import tensorflow as tf
+
+# ---------- A) 加法 PGD / FGSM  (只往上) ----------
+def at_pgd_inject(
+    model, X_np, y_np, *,
+    epsilon, alpha=0.01, num_iter=40,
+    targeted=False, step_idx=None, feat_idx=None, max_num_of_features=3
+):
+    X_orig = X_np.astype(np.float32)
+    X_adv  = X_orig.copy()
+    y_tf   = tf.convert_to_tensor(y_np, dtype=tf.float32)
+
+    # ----靜態 mask (和你原版完全相同)----
+    mask = np.zeros_like(X_orig, dtype=np.float32)
+    if (step_idx is not None) and (feat_idx is not None):
+        if isinstance(feat_idx, (list, tuple, np.ndarray)):
+            mask[:, step_idx, feat_idx] = 1.0
+        else:
+            mask[:, step_idx, feat_idx] = 1.0
+    else:
+        if mask.ndim == 3:
+            mask[..., :max_num_of_features] = 1.0
+        elif mask.ndim == 2:
+            mask[:, :max_num_of_features]  = 1.0
+        else:
+            raise ValueError("X_np 維度不符")
+
+    loss_fn = tf.keras.losses.MeanSquaredError()
+
+    for _ in range(num_iter):
+        X_var = tf.Variable(X_adv)
+        with tf.GradientTape() as tape:
+            tape.watch(X_var)
+            preds = model(X_var, training=False)
+            loss  = loss_fn(y_tf, preds)
+            if targeted:
+                loss = -loss
+        grad = tape.gradient(loss, X_var)
+        if grad is None:
+            break
+        grad_pos = (np.sign(grad.numpy()) > 0).astype(np.float32)
+        X_adv += alpha * grad_pos * mask
+
+        delta = X_adv - X_orig
+        X_adv = X_orig + np.clip(delta, 0.0, epsilon) * mask + delta * (1 - mask)
+
+    return X_adv.astype(np.float32)
+
+# ---------- B) PET 乘法擾動 (RDM + 退火) ----------
+def pet_inject(
+    model, X_np, y_np, *,
+    epsilon, alpha=0.01, num_iter=3,
+    epoch_idx=0, total_epoch=50,
+    num_seg=8, J_ratio=0.5,
+    targeted=False, step_idx=None, feat_idx=None, max_num_of_features=3,
+):
+    X_orig = X_np.astype(np.float32)
+    X_adv  = X_orig.copy()
+    y_tf   = tf.convert_to_tensor(y_np, dtype=tf.float32)
+
+    # ----靜態 mask_base (同上)----
+    mask_base = np.zeros_like(X_orig, dtype=np.float32)
+    if (step_idx is not None) and (feat_idx is not None):
+        if isinstance(feat_idx, (list, tuple, np.ndarray)):
+            mask_base[:, step_idx, feat_idx] = 1.0
+        else:
+            mask_base[:, step_idx, feat_idx] = 1.0
+    else:
+        if mask_base.ndim == 3:
+            mask_base[..., :max_num_of_features] = 1.0
+        elif mask_base.ndim == 2:
+            mask_base[:, :max_num_of_features]  = 1.0
+        else:
+            raise ValueError("X_np 維度不符")
+
+    loss_fn = tf.keras.losses.MeanSquaredError()
+
+    for _ in range(num_iter):
+        X_var = tf.Variable(X_adv)
+        with tf.GradientTape() as tape:
+            tape.watch(X_var)
+            preds = model(X_var, training=False)
+            loss  = loss_fn(y_tf, preds)
+            if targeted:
+                loss = -loss
+        grad = tape.gradient(loss, X_var)
+        if grad is None:
+            break
+
+        grad_pos  = (np.sign(grad.numpy()) > 0).astype(np.float32)
+        delta_adv = alpha * grad_pos * mask_base
+        delta_adv = np.clip(delta_adv, 0.0, epsilon)
+
+        # ----RDM 動態遮罩----
+        p = 1.0 - min(epoch_idx / total_epoch, 1.0)   # 退火係數
+        if X_orig.ndim == 3:
+            B, T, F = X_orig.shape
+            seg_len = T // num_seg
+            n_mask  = int(np.floor(J_ratio * p * num_seg))
+            mask_seg = np.ones((B, T, 1), dtype=np.float32)
+            if n_mask > 0:
+                chosen = np.random.choice(num_seg, n_mask, replace=False)
+                for idx in chosen:
+                    s, e = idx * seg_len, (idx + 1) * seg_len
+                    mask_seg[:, s:e, :] = 0.0
+            mask_dyn  = mask_seg if F == 1 else np.repeat(mask_seg, F, axis=-1)
+            final_mask = mask_base * mask_dyn
+        else:
+            final_mask = mask_base  # 2D 不做時間分段
+
+        # 乘法擾動
+        X_adv = (1.0 + delta_adv * final_mask) * X_adv
+        X_adv = np.clip(X_adv, 0.0, 1.0)
+
+    return X_adv.astype(np.float32)
+
+
+class WrapperTCNWithAT_2(tf.keras.Model):
+    """
+    TCN 對抗訓練 (支援 FGSM / PGD / PET)
+    """
+    def __init__(
+        self,
+        look_back,
+        n_features,
+        max_num_of_features,
+        epsilon=0.1,
+        step_idx=None,
+        feat_idx=None,
+        model_name="TCN",
+        alpha=0.5,
+        mixed=False,
+        attack_method="PET",
+        **gen_kwargs                   # 其餘注入器參數
+    ):
+        super().__init__()
+        # ----------超參----------
+        self.max_num_of_features = max_num_of_features
+        self.epsilon  = epsilon
+        self.step_idx = step_idx
+        self.feat_idx = feat_idx
+        self.alpha    = alpha
+        self.mixed    = mixed
+        self.attack_method = attack_method.upper()
+        self.gen_kwargs    = gen_kwargs
+
+        # ----------backbone----------
+        if model_name == "TCN":
+            self.backbone = build_model_TCN(look_back, n_features)
+        elif model_name == "D-TCN":
+            self.backbone = build_model_double_TCN(look_back, n_features)
+        else:
+            raise ValueError("model_name 必須 'TCN' 或 'D-TCN'")
+
+        # ----------opt / loss----------
+        self.optimizer = tf.keras.optimizers.Adam(1e-3)
+        self.loss_fn   = lambda y_t, y_p: tf.sqrt(tf.reduce_mean(tf.square(y_t - y_p)))
+
+        # ----------內部計數器----------
+        self.steps_per_epoch: int | None = None  # ← 外部必須設定
+        self.batch_counter: int = 0              # 每跑一個 train_step +1
+
+    # ---------------- compile ----------------
+    def compile(self, optimizer=None, loss=None, **kwargs):
+        super().compile(run_eagerly=False, **kwargs)
+        if optimizer is not None:
+            self.optimizer = optimizer
+        if loss is not None:
+            self.loss_fn   = loss
+        self.train_metric = tf.keras.metrics.Mean(name="train_rmse")
+        self.val_metric   = tf.keras.metrics.Mean(name="val_rmse")
+
+    # ---------------- 共用對抗樣本產生 ----------------
+    def _adv_generate(self, x_clean, y_true, epoch_idx: int):
+        x_np, y_np = x_clean.numpy(), y_true.numpy()
+
+        if self.attack_method == "FGSM":
+            adv_np = fgsm_inject_one_pos(
+                model=self.backbone, X_np=x_np, y_np=y_np,
+                epsilon=self.epsilon,
+                step_idx=self.step_idx, feat_idx=self.feat_idx,
+                max_num_of_features=self.max_num_of_features)
+        elif self.attack_method in {"PGD", "AT"}:
+            adv_np = at_pgd_inject(
+                model=self.backbone, X_np=x_np, y_np=y_np,
+                epsilon=self.epsilon,
+                step_idx=self.step_idx, feat_idx=self.feat_idx,
+                max_num_of_features=self.max_num_of_features,
+                **self.gen_kwargs)
+        elif self.attack_method == "PET":
+            adv_np = pet_inject(
+                model=self.backbone, X_np=x_np, y_np=y_np,
+                epsilon=self.epsilon,
+                step_idx=self.step_idx, feat_idx=self.feat_idx,
+                max_num_of_features=self.max_num_of_features,
+                epoch_idx=epoch_idx,
+                **self.gen_kwargs)
+        else:
+            raise ValueError("attack_method 必須 FGSM / PGD / PET")
+
+        return adv_np.astype(np.float32)
+
+    # ---------------- train_step ----------------
+    def train_step(self, data):
+        if self.steps_per_epoch is None:
+            raise ValueError("請先設定 model.steps_per_epoch 再呼叫 fit()")
+
+        # 0) 計算目前 epoch
+        epoch_idx = self.batch_counter // self.steps_per_epoch
+
+        # 1) 生成對抗樣本
+        x_clean, y_true = data
+        y_true = tf.reshape(y_true, [-1, 1])
+
+        x_adv = tf.py_function(
+            func=lambda a, b: self._adv_generate(a, b, epoch_idx),
+            inp=[x_clean, y_true],
+            Tout=tf.float32)
+        x_adv.set_shape(x_clean.shape)
+
+        # 2) clean/adv 混合
+        x_used = self.alpha * x_adv + (1 - self.alpha) * x_clean if self.mixed else x_adv
+
+        # 3) 前向 + 反向
+        with tf.GradientTape() as tape:
+            preds = self.backbone(x_used, training=True)
+            loss  = self.loss_fn(y_true, preds)
+        grads = tape.gradient(loss, self.backbone.trainable_weights)
+        self.optimizer.apply_gradients(zip(grads, self.backbone.trainable_weights))
+
+        self.train_metric.update_state(loss)
+        self.batch_counter += 1     # ←★ 累加
+        return {"loss": self.train_metric.result()}
+
+    # ---------------- test_step / call ---------
+    def test_step(self, data):
+        x, y = data
+        y = tf.reshape(y, [-1, 1])
+        preds = self.backbone(x, training=False)
+        loss  = self.loss_fn(y, preds)
+        self.val_metric.update_state(loss)
+        return {"loss": self.val_metric.result()}
+
     def call(self, inputs, training=None):
         return self.backbone(inputs, training=training)
