@@ -1,0 +1,14 @@
+{
+  "max_num_of_features": 1,
+  "epsilon": 0.05,
+  "model_name": "TCN",
+  "step_idx": null,
+  "feat_idx": [
+    0
+  ],
+  "alpha": 0.3,
+  "attack_method": "FGSM",
+  "mixed": false,
+  "look_back": 24,
+  "n_features": 1
+}
